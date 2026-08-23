@@ -1,0 +1,31 @@
+# Pure Data Struct (Zero vtable overhead, stack-allocated POD)
+struct Vector3 {
+    x: float
+    y: float
+    z: float = 0.0
+}
+
+# Behavioral Entity
+class PhysicsEngine {
+    gravity: float
+
+    def PhysicsEngine(self, g: float = 9.81) {
+        self.gravity = g
+    }
+
+    # Instance method
+    def apply_gravity(self, v: Vector3): Vector3 {
+        return Vector3(v.x, v.y - self.gravity, v.z)
+    }
+}
+
+class App {
+    # Static entry method - No 'let' used anywhere
+    static def main(): int {
+        pos: Vector3 = Vector3(10.0, 50.0, 0.0)
+        engine: PhysicsEngine = PhysicsEngine()
+        
+        updated: Vector3 = engine.apply_gravity(pos)
+        return updated.y as int
+    }
+}

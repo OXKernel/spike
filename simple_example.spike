@@ -1,0 +1,21 @@
+class Syscall {
+    static def write(fd: int, buf: usize, count: usize): int {
+        result: int = 0
+        asm {
+            "syscall"
+            : "=a"(result)
+            : "a"(1), "D"(fd), "S"(buf), "d"(count)
+            : "rcx", "r11", "memory"
+        }
+        return result
+    }
+}
+
+class App {
+    # Pure OOP Entry Point linked to native OS main
+    static def main(): int {
+        msg: String = "Spike pure OOP User-Space\n"
+        Syscall.write(1, msg.data as usize, msg.length)
+        return 0
+    }
+}

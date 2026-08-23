@@ -1,5 +1,7 @@
 # The Spike Programming Language: Specification & Reference Manual
 
+## 0. Designed by Roger Doss, PhD
+
 ## 1. Core Paradigm & Invariants
 * **Pure Object-Oriented Architecture:** Standalone functions are strictly forbidden. All executable logic resides as instance or static methods inside a `class`.
 * **Pure Data Structs (`struct`):** Structs are strictly zero-overhead, stack-allocated plain-old-data (POD) aggregates. Structs cannot contain methods, virtual tables, or inheritance.

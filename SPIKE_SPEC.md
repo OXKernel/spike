@@ -9,6 +9,23 @@
 * **Deterministic ARC + Ownership Escapes:** Managed `class` instances use thread-safe atomic reference counting. Hardware memory handoffs use `disown` and `own`.
 * **Transparent C ABI:** Zero name mangling. Direct, bidirectional integration with assembly and C.
 
+### 1.2 Comments and Docstrings
+Spike strictly adheres to Python-style commenting conventions. C-style comments (`/* ... */` and `//`) are not supported.
+
+* **Single-Line Comments:** Indicated by the `#` symbol. Everything following `#` on the same line is ignored by the parser.
+* **Multi-Line Comments & Docstrings:** Multi-line descriptions and block comments use triple single-quotes (`'''`) or triple double-quotes (`"""`).
+
+```python
+"""
+Disk Block Allocator
+Manages free list bitmap allocations for raw block storage.
+"""
+
+struct Superblock {
+    magic: u32 # Filesystem magic header (0xEF53)
+    block_size: u32
+}
+
 ---
 
 ## 2. Syntax Overview

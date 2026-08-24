@@ -112,7 +112,14 @@ class IndentedBraceLexer:
     }
 
     def __init__(self, source: str):
-        self.source = source
+        clean_src = source.replace('\r\n', '\n')
+        # Replace multiline triple quotes with equivalent blank lines
+        self.source = re.sub(
+            r'(""".*?"""|\'\'\'.*?\'\'\')',
+            lambda m: '\n' * m.group(0).count('\n'),
+            clean_src,
+            flags=re.DOTALL
+        )
         self.indent_stack = [0]
         self.brace_depth = 0
         self.expecting_indent = False

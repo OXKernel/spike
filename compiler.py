@@ -1,1158 +1,1051 @@
-import enum
+"""
+compiler.py - Spike Language Compiler & C Transpiler
+Supports user-space and freestanding kernel-mode compilation targets.
+Provides precise line and column diagnostics on syntax & semantic errors.
+"""
+
+from __future__ import annotations
 import sys
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Set, Tuple as PyTuple
+from typing import Any, Dict, List, Optional, Set, Union
 
-# =============================================================================
-# 1. LEXER (LET REMOVED)
-# =============================================================================
 
-class TokenType(enum.Enum):
-    LBRACE       = "{"
-    RBRACE       = "}"
-    LPAREN       = "("
-    RPAREN       = ")"
-    LBRACKET     = "["
-    RBRACKET     = "]"
-    COLON        = ":"
-    COMMA        = ","
-    DOT          = "."
-    SEMICOLON    = ";"
-    NEWLINE      = "NEWLINE"
-    INDENT       = "INDENT"
-    DEDENT       = "DEDENT"
-    ARROW        = "=>"
-    
-    IDENT        = "IDENT"
-    INT_LIT      = "INT_LIT"
-    FLOAT_LIT    = "FLOAT_LIT"
-    STRING_LIT   = "STRING_LIT"
-    BOOL_LIT     = "BOOL_LIT"
-    
-    CLASS        = "class"
-    STRUCT       = "struct"
-    ENUM         = "enum"
-    DEF          = "def"
-    STATIC       = "static"
-    EXTERN       = "extern"
-    EXPORT       = "export"
-    RETURN       = "return"
-    IF           = "if"
-    ELSE         = "else"
-    WHILE        = "while"
-    FOR          = "for"
-    IN           = "in"
-    BREAK        = "break"
-    CONTINUE     = "continue"
-    ASM          = "asm"
-    DISOWN       = "disown"
-    OWN          = "own"
-    MANUAL     = "manual"
-    TRY          = "try"
-    EXCEPT       = "except"
-    FINALLY      = "finally"
-    RAISE        = "raise"
-    IMPORT       = "import"
-    FROM         = "from"
-    SIZEOF       = "sizeof"
-    TYPEOF       = "type_of"
-    LEN          = "len"
-    AS           = "as"
-    IS           = "is"
-    
-    ASSIGN       = "="
-    PLUS_ASSIGN  = "+="
-    MINUS_ASSIGN = "-="
-    STAR_ASSIGN  = "*="
-    SLASH_ASSIGN = "/="
-    PLUS         = "+"
-    MINUS        = "-"
-    STAR         = "*"
-    SLASH        = "/"
-    PERCENT      = "%"
-    AMPERSAND    = "&"
-    PIPE         = "|"
-    CARET        = "^"
-    TILDE        = "~"
-    SHL          = "<<"
-    SHR          = ">>"
-    EQ           = "=="
-    NEQ          = "!="
-    LT           = "<"
-    GT           = ">"
-    LTE          = "<="
-    GTE          = ">="
-    AND          = "and"
-    OR           = "or"
-    NOT          = "not"
-    
-    EOF          = "EOF"
+# ============================================================================
+# 1. Lexer & Tokens
+# ============================================================================
+
+class TokenType:
+    # Keywords
+    CONST = "CONST"
+    STRUCT = "STRUCT"
+    CLASS = "CLASS"
+    DEF = "DEF"
+    STATIC = "STATIC"
+    EXPORT = "EXPORT"
+    ASM = "ASM"
+    AS = "AS"
+    WHILE = "WHILE"
+    IF = "IF"
+    ELSE = "ELSE"
+    RETURN = "RETURN"
+    TRUE = "TRUE"
+    FALSE = "FALSE"
+
+    # Identifiers and Literals
+    IDENTIFIER = "IDENTIFIER"
+    INT_LITERAL = "INT_LITERAL"
+    HEX_LITERAL = "HEX_LITERAL"
+    STRING_LITERAL = "STRING_LITERAL"
+
+    # Symbols and Operators
+    LBRACE = "LBRACE"          # {
+    RBRACE = "RBRACE"          # }
+    LPAREN = "LPAREN"          # (
+    RPAREN = "RPAREN"          # )
+    COLON = "COLON"            # :
+    SEMICOLON = "SEMICOLON"    # ;
+    COMMA = "COMMA"            # ,
+    DOT = "DOT"                # .
+    ARROW = "ARROW"            # ->
+    EQUALS = "EQUALS"          # =
+    PLUS = "PLUS"              # +
+    MINUS = "MINUS"            # -
+    STAR = "STAR"              # *
+    SLASH = "SLASH"            # /
+    PERCENT = "PERCENT"        # %
+    AMP = "AMP"                # &
+    PIPE = "PIPE"              # |
+    CARET = "CARET"            # ^
+    BANG = "BANG"              # !
+    LT = "LT"                  # <
+    GT = "GT"                  # >
+    LE = "LE"                  # <=
+    GE = "GE"                  # >=
+    EQ = "EQ"                  # ==
+    NE = "NE"                  # !=
+
+    EOF = "EOF"
+
+
+KEYWORDS = {
+    "const": TokenType.CONST,
+    "struct": TokenType.STRUCT,
+    "class": TokenType.CLASS,
+    "def": TokenType.DEF,
+    "static": TokenType.STATIC,
+    "export": TokenType.EXPORT,
+    "asm": TokenType.ASM,
+    "as": TokenType.AS,
+    "while": TokenType.WHILE,
+    "if": TokenType.IF,
+    "else": TokenType.ELSE,
+    "return": TokenType.RETURN,
+    "True": TokenType.TRUE,
+    "False": TokenType.FALSE,
+}
+
 
 class Token:
-    def __init__(self, type_: TokenType, value: any, line: int):
+    def __init__(self, type_: str, value: Any, line: int, col: int):
         self.type = type_
         self.value = value
         self.line = line
+        self.col = col
 
-class IndentedBraceLexer:
-    # Strictly pure OOP keywords - no 'let' keyword
-    KEYWORDS = {
-        "class": TokenType.CLASS, "struct": TokenType.STRUCT, "enum": TokenType.ENUM,
-        "def": TokenType.DEF, "static": TokenType.STATIC, "extern": TokenType.EXTERN,
-        "export": TokenType.EXPORT, "return": TokenType.RETURN, "if": TokenType.IF,
-        "else": TokenType.ELSE, "while": TokenType.WHILE, "for": TokenType.FOR,
-        "in": TokenType.IN, "break": TokenType.BREAK, "continue": TokenType.CONTINUE,
-        "asm": TokenType.ASM, "disown": TokenType.DISOWN, "own": TokenType.OWN,
-        "manual": TokenType.MANUAL, "try": TokenType.TRY, "except": TokenType.EXCEPT,
-        "finally": TokenType.FINALLY, "raise": TokenType.RAISE, "import": TokenType.IMPORT,
-        "from": TokenType.FROM, "sizeof": TokenType.SIZEOF, "type_of": TokenType.TYPEOF,
-        "len": TokenType.LEN, "as": TokenType.AS, "is": TokenType.IS,
-        "and": TokenType.AND, "or": TokenType.OR, "not": TokenType.NOT,
-        "True": TokenType.BOOL_LIT, "False": TokenType.BOOL_LIT
-    }
+    def __repr__(self) -> str:
+        return f"Token({self.type}, {repr(self.value)}, L{self.line}:C{self.col})"
 
+
+class Lexer:
     def __init__(self, source: str):
-        clean_src = source.replace('\r\n', '\n')
-        # Replace multiline triple quotes with equivalent blank lines
-        self.source = re.sub(
-            r'(""".*?"""|\'\'\'.*?\'\'\')',
-            lambda m: '\n' * m.group(0).count('\n'),
-            clean_src,
-            flags=re.DOTALL
-        )
-        self.indent_stack = [0]
-        self.brace_depth = 0
-        self.expecting_indent = False
+        self.source = source
+        self.pos = 0
+        self.line = 1
+        self.col = 1
+        self.length = len(source)
+
+    def _peek(self, offset: int = 0) -> str:
+        idx = self.pos + offset
+        if idx >= self.length:
+            return ""
+        return self.source[idx]
+
+    def _advance(self) -> str:
+        if self.pos >= self.length:
+            return ""
+        char = self.source[self.pos]
+        self.pos += 1
+        if char == "\n":
+            self.line += 1
+            self.col = 1
+        else:
+            self.col += 1
+        return char
 
     def tokenize(self) -> List[Token]:
-        tokens = []
-        for line_num, raw_line in enumerate(self.source.splitlines(keepends=True), start=1):
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"): continue
+        tokens: List[Token] = []
 
-            indent = 0
-            i = 0
-            while i < len(raw_line) and raw_line[i] in " \t":
-                indent += (4 if raw_line[i] == "\t" else 1)
-                i += 1
+        while self.pos < self.length:
+            char = self._peek()
 
-            if self.expecting_indent:
-                if indent <= self.indent_stack[-1]:
-                    raise SyntaxError(f"Line {line_num}: Expected indented block after '{{'")
-                self.indent_stack.append(indent)
-                tokens.append(Token(TokenType.INDENT, indent, line_num))
-                self.expecting_indent = False
-            elif indent < self.indent_stack[-1]:
-                while self.indent_stack and self.indent_stack[-1] > indent:
-                    self.indent_stack.pop()
-                    tokens.append(Token(TokenType.DEDENT, None, line_num))
-                if self.indent_stack[-1] != indent:
-                    raise SyntaxError(f"Line {line_num}: Unaligned dedent depth ({indent})")
+            # Skip Whitespace
+            if char in (" ", "\t", "\r", "\n"):
+                self._advance()
+                continue
 
-            while i < len(raw_line):
-                ch = raw_line[i]
-                if ch in " \t\r": i += 1; continue
-                if ch == "\n": tokens.append(Token(TokenType.NEWLINE, "\n", line_num)); break
-                if ch == "#": break
+            # Python-style single-line comments (#)
+            if char == "#":
+                while self._peek() and self._peek() != "\n":
+                    self._advance()
+                continue
 
-                two = raw_line[i:i+2]
-                if two == "=>": tokens.append(Token(TokenType.ARROW, "=>", line_num)); i += 2; continue
-                if two == "==": tokens.append(Token(TokenType.EQ, "==", line_num)); i += 2; continue
-                if two == "!=": tokens.append(Token(TokenType.NEQ, "!=", line_num)); i += 2; continue
-                if two == "<=": tokens.append(Token(TokenType.LTE, "<=", line_num)); i += 2; continue
-                if two == ">=": tokens.append(Token(TokenType.GTE, ">=", line_num)); i += 2; continue
-                if two == "<<": tokens.append(Token(TokenType.SHL, "<<", line_num)); i += 2; continue
-                if two == ">>": tokens.append(Token(TokenType.SHR, ">>", line_num)); i += 2; continue
-                if two == "+=": tokens.append(Token(TokenType.PLUS_ASSIGN, "+=", line_num)); i += 2; continue
-                if two == "-=": tokens.append(Token(TokenType.MINUS_ASSIGN, "-=", line_num)); i += 2; continue
-                if two == "*=": tokens.append(Token(TokenType.STAR_ASSIGN, "*=", line_num)); i += 2; continue
-                if two == "/=": tokens.append(Token(TokenType.SLASH_ASSIGN, "/=", line_num)); i += 2; continue
+            # C-style comments (// and /* */)
+            if char == "/" and self._peek(1) == "/":
+                while self._peek() and self._peek() != "\n":
+                    self._advance()
+                continue
+            if char == "/" and self._peek(1) == "*":
+                self._advance()
+                self._advance()
+                while self._peek() and not (self._peek() == "*" and self._peek(1) == "/"):
+                    self._advance()
+                if self._peek():
+                    self._advance()
+                    self._advance()
+                continue
 
-                if ch == "{": self.brace_depth += 1; self.expecting_indent = True; tokens.append(Token(TokenType.LBRACE, "{", line_num)); i += 1; continue
-                if ch == "}": self.brace_depth -= 1; tokens.append(Token(TokenType.RBRACE, "}", line_num)); i += 1; continue
-                if ch == "(": tokens.append(Token(TokenType.LPAREN, "(", line_num)); i += 1; continue
-                if ch == ")": tokens.append(Token(TokenType.RPAREN, ")", line_num)); i += 1; continue
-                if ch == "[": tokens.append(Token(TokenType.LBRACKET, "[", line_num)); i += 1; continue
-                if ch == "]": tokens.append(Token(TokenType.RBRACKET, "]", line_num)); i += 1; continue
-                if ch == ":": tokens.append(Token(TokenType.COLON, ":", line_num)); i += 1; continue
-                if ch == ",": tokens.append(Token(TokenType.COMMA, ",", line_num)); i += 1; continue
-                if ch == ".": tokens.append(Token(TokenType.DOT, ".", line_num)); i += 1; continue
-                if ch == ";": tokens.append(Token(TokenType.SEMICOLON, ";", line_num)); i += 1; continue
-                if ch == "=": tokens.append(Token(TokenType.ASSIGN, "=", line_num)); i += 1; continue
-                if ch == "+": tokens.append(Token(TokenType.PLUS, "+", line_num)); i += 1; continue
-                if ch == "-": tokens.append(Token(TokenType.MINUS, "-", line_num)); i += 1; continue
-                if ch == "*": tokens.append(Token(TokenType.STAR, "*", line_num)); i += 1; continue
-                if ch == "/": tokens.append(Token(TokenType.SLASH, "/", line_num)); i += 1; continue
-                if ch == "%": tokens.append(Token(TokenType.PERCENT, "%", line_num)); i += 1; continue
-                if ch == "&": tokens.append(Token(TokenType.AMPERSAND, "&", line_num)); i += 1; continue
-                if ch == "|": tokens.append(Token(TokenType.PIPE, "|", line_num)); i += 1; continue
-                if ch == "^": tokens.append(Token(TokenType.CARET, "^", line_num)); i += 1; continue
-                if ch == "~": tokens.append(Token(TokenType.TILDE, "~", line_num)); i += 1; continue
-                if ch == "<": tokens.append(Token(TokenType.LT, "<", line_num)); i += 1; continue
-                if ch == ">": tokens.append(Token(TokenType.GT, ">", line_num)); i += 1; continue
+            start_line, start_col = self.line, self.col
 
-                if ch in ('"', "'"):
-                    q = ch; val = []; i += 1
-                    while i < len(raw_line) and raw_line[i] != q:
-                        if raw_line[i] == "\\" and i + 1 < len(raw_line):
-                            val.append(raw_line[i:i+2]); i += 2
-                        else:
-                            val.append(raw_line[i]); i += 1
-                    i += 1
-                    tokens.append(Token(TokenType.STRING_LIT, "".join(val), line_num))
-                    continue
+            # Hex numbers (0x...)
+            if char == "0" and self._peek(1) in ("x", "X"):
+                self._advance()
+                self._advance()
+                num_str = "0x"
+                while self._peek() in "0123456789abcdefABCDEF":
+                    num_str += self._advance()
+                tokens.append(Token(TokenType.HEX_LITERAL, int(num_str, 16), start_line, start_col))
+                continue
 
-                if ch.isdigit() or (ch == '0' and i + 1 < len(raw_line) and raw_line[i+1] in 'xX'):
-                    val = []
-                    if raw_line.startswith(("0x", "0X"), i):
-                        val.extend([raw_line[i], raw_line[i+1]]); i += 2
-                        while i < len(raw_line) and (raw_line[i].isdigit() or raw_line[i] in 'abcdefABCDEF'):
-                            val.append(raw_line[i]); i += 1
-                        tokens.append(Token(TokenType.INT_LIT, int("".join(val), 16), line_num))
-                        continue
-                    is_float = False
-                    while i < len(raw_line) and (raw_line[i].isdigit() or raw_line[i] == '.'):
-                        if raw_line[i] == '.':
-                            if is_float: break
-                            is_float = True
-                        val.append(raw_line[i]); i += 1
-                    s_num = "".join(val)
-                    tokens.append(Token(TokenType.FLOAT_LIT if is_float else TokenType.INT_LIT, float(s_num) if is_float else int(s_num), line_num))
-                    continue
+            # Decimal numbers
+            if char.isdigit():
+                num_str = ""
+                while self._peek().isdigit():
+                    num_str += self._advance()
+                tokens.append(Token(TokenType.INT_LITERAL, int(num_str), start_line, start_col))
+                continue
 
-                if ch.isalpha() or ch == "_":
-                    val = []
-                    while i < len(raw_line) and (raw_line[i].isalnum() or raw_line[i] == "_"):
-                        val.append(raw_line[i]); i += 1
-                    ident = "".join(val)
-                    ttype = self.KEYWORDS.get(ident, TokenType.IDENT)
-                    b_val = True if ident == "True" else (False if ident == "False" else ident)
-                    tokens.append(Token(ttype, b_val, line_num))
-                    continue
+            # Identifiers and Keywords
+            if char.isalpha() or char == "_":
+                ident = ""
+                while self._peek().isalnum() or self._peek() == "_":
+                    ident += self._advance()
+                token_type = KEYWORDS.get(ident, TokenType.IDENTIFIER)
+                tokens.append(Token(token_type, ident, start_line, start_col))
+                continue
 
-                raise SyntaxError(f"Line {line_num}: Unexpected character '{ch}'")
+            # String literals
+            if char in ('"', "'"):
+                quote_type = self._advance()
+                str_val = ""
+                while self._peek() and self._peek() != quote_type:
+                    if self._peek() == "\\":
+                        self._advance()
+                        str_val += "\\" + self._advance()
+                    else:
+                        str_val += self._advance()
+                if self._peek() == quote_type:
+                    self._advance()
+                tokens.append(Token(TokenType.STRING_LITERAL, str_val, start_line, start_col))
+                continue
 
-        while len(self.indent_stack) > 1:
-            self.indent_stack.pop()
-            tokens.append(Token(TokenType.DEDENT, None, 0))
-        tokens.append(Token(TokenType.EOF, None, 0))
+            # Multi-character Operators
+            if char == "-" and self._peek(1) == ">":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.ARROW, "->", start_line, start_col))
+                continue
+            if char == "=" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.EQ, "==", start_line, start_col))
+                continue
+            if char == "!" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.NE, "!=", start_line, start_col))
+                continue
+            if char == "<" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.LE, "<=", start_line, start_col))
+                continue
+            if char == ">" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.GE, ">=", start_line, start_col))
+                continue
+
+            # Single-character Delimiters & Operators
+            single_char_tokens = {
+                "{": TokenType.LBRACE,
+                "}": TokenType.RBRACE,
+                "(": TokenType.LPAREN,
+                ")": TokenType.RPAREN,
+                ":": TokenType.COLON,
+                ";": TokenType.SEMICOLON,
+                ",": TokenType.COMMA,
+                ".": TokenType.DOT,
+                "=": TokenType.EQUALS,
+                "+": TokenType.PLUS,
+                "-": TokenType.MINUS,
+                "*": TokenType.STAR,
+                "/": TokenType.SLASH,
+                "%": TokenType.PERCENT,
+                "&": TokenType.AMP,
+                "|": TokenType.PIPE,
+                "^": TokenType.CARET,
+                "!": TokenType.BANG,
+                "<": TokenType.LT,
+                ">": TokenType.GT,
+            }
+
+            if char in single_char_tokens:
+                self._advance()
+                tokens.append(Token(single_char_tokens[char], char, start_line, start_col))
+                continue
+
+            self._advance()
+
+        tokens.append(Token(TokenType.EOF, None, self.line, self.col))
         return tokens
 
-# =============================================================================
-# 2. AST DEFINITIONS
-# =============================================================================
 
-class ASTNode: pass
-class Expr(ASTNode): pass
+# ============================================================================
+# 2. Abstract Syntax Tree (AST) Nodes (With Line & Col Metadata)
+# ============================================================================
 
-@dataclass
-class IntLiteral(Expr): value: int
-@dataclass
-class FloatLiteral(Expr): value: float
-@dataclass
-class StringLiteral(Expr): value: str
-@dataclass
-class BoolLiteral(Expr): value: bool
-@dataclass
-class Identifier(Expr): name: str
-@dataclass
-class UnaryExpr(Expr): op: str; right: Expr
-@dataclass
-class BinaryExpr(Expr): left: Expr; op: str; right: Expr
-@dataclass
-class MemberAccessExpr(Expr): target: Expr; member: str
-@dataclass
-class IndexAccessExpr(Expr): target: Expr; index: Expr
-@dataclass
-class SliceExpr(Expr): target: Expr; start: Expr; end: Expr
-@dataclass
-class CastExpr(Expr): target: Expr; to_type: str
-@dataclass
-class TypeCheckExpr(Expr): target: Expr; type_name: str
-@dataclass
-class SizeofExpr(Expr): type_name: str
-@dataclass
-class LenExpr(Expr): target: Expr
-@dataclass
-class NamedArg: name: str; value: Expr
-@dataclass
-class CallExpr(Expr):
-    callee: Expr
-    args: List[Expr]
-    named_args: List[NamedArg] = field(default_factory=list)
-@dataclass
-class ListLiteral(Expr): elements: List[Expr]
-@dataclass
-class TupleLiteral(Expr): elements: List[Expr]
-@dataclass
-class ManualAllocExpr(Expr): class_name: str; args: List[Expr]
-@dataclass
-class Param:
-    name: str
-    type_name: str
-    default_value: Optional[Expr] = None
-@dataclass
-class LambdaExpr(Expr):
-    params: List[Param]
-    return_type: Optional[str]
-    body: List['Stmt']
-    lambda_id: int = 0
-    captured_vars: List[str] = field(default_factory=list)
+class ASTNode:
+    def __init__(self, line: int = 0, col: int = 0):
+        self.line = line
+        self.col = col
 
-class Stmt(ASTNode): pass
+class ProgramNode(ASTNode):
+    def __init__(self, declarations: List[ASTNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.declarations = declarations
 
-@dataclass
-class ImportStmt(Stmt): module_path: List[str]; symbols: Optional[List[str]] = None
-@dataclass
-class VarDeclStmt(Stmt): name: str; type_name: str; initializer: Optional[Expr] = None
-@dataclass
-class UnpackVarDeclStmt(Stmt): names: List[str]; type_names: List[str]; initializer: Expr
-@dataclass
-class AssignStmt(Stmt): target: Expr; op: str; value: Expr
-@dataclass
-class ReturnStmt(Stmt): value: Optional[Expr] = None
-@dataclass
-class BreakStmt(Stmt): pass
-@dataclass
-class ContinueStmt(Stmt): pass
-@dataclass
-class IfStmt(Stmt): condition: Expr; then_body: List[Stmt]; else_body: Optional[List[Stmt]] = None
-@dataclass
-class WhileStmt(Stmt): condition: Expr; body: List[Stmt]
-@dataclass
-class ForRangeStmt(Stmt):
-    var_name: str
-    start: Expr
-    stop: Expr
-    step: Expr
-    body: List[Stmt]
-@dataclass
-class ExprStmt(Stmt): expr: Expr
-@dataclass
-class DisownStmt(Stmt): target: Expr
-@dataclass
-class OwnStmt(Stmt): target: Expr
-@dataclass
-class RaiseStmt(Stmt): exception: Expr
-@dataclass
-class ExceptHandler: var_name: Optional[str]; exc_type: str; body: List[Stmt]
-@dataclass
-class TryStmt(Stmt): body: List[Stmt]; handlers: List[ExceptHandler]; finally_body: Optional[List[Stmt]] = None
-@dataclass
-class AsmConstraint: constraint: str; variable: Expr
-@dataclass
-class AsmStmt(Stmt): template: str; outputs: List[AsmConstraint]; inputs: List[AsmConstraint]; clobbers: List[str]
+class ConstDeclNode(ASTNode):
+    def __init__(self, name: str, var_type: str, value_expr: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.var_type = var_type
+        self.value_expr = value_expr
 
-@dataclass
-class FieldDecl(ASTNode): name: str; type_name: str; default_value: Optional[Expr] = None
-@dataclass
-class MethodDecl(ASTNode):
-    name: str
-    params: List[Param]
-    return_type: Optional[str]
-    body: Optional[List[Stmt]] = None
-    is_static: bool = False
-    is_extern: bool = False
-    is_export: bool = False
+class StructFieldNode(ASTNode):
+    def __init__(self, name: str, field_type: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.field_type = field_type
 
-@dataclass
-class ClassDecl(ASTNode): name: str; parent_name: Optional[str]; fields: List[FieldDecl]; methods: List[MethodDecl]
-@dataclass
-class StructDecl(ASTNode): name: str; fields: List[FieldDecl]  # Pure data: no methods list
-@dataclass
-class EnumMember: name: str; value: int
-@dataclass
-class EnumDecl(ASTNode): name: str; members: List[EnumMember]
+class StructDeclNode(ASTNode):
+    def __init__(self, name: str, fields: List[StructFieldNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.fields = fields
 
-@dataclass
-class Program(ASTNode):
-    imports: List[ImportStmt]
-    enums: List[EnumDecl]
-    structs: List[StructDecl]
-    classes: List[ClassDecl]
+class MethodDeclNode(ASTNode):
+    def __init__(self, name: str, params: List[tuple[str, str]], return_type: str,
+                 body: List[ASTNode], is_static: bool = False, is_export: bool = False,
+                 line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.params = params
+        self.return_type = return_type
+        self.body = body
+        self.is_static = is_static
+        self.is_export = is_export
 
-# =============================================================================
-# 3. PARSER (PURE OOP & PURE DATA STRUCTS)
-# =============================================================================
+class ClassDeclNode(ASTNode):
+    def __init__(self, name: str, methods: List[MethodDeclNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.methods = methods
+
+class VarDeclNode(ASTNode):
+    def __init__(self, name: str, var_type: Optional[str], value_expr: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.var_type = var_type
+        self.value_expr = value_expr
+
+class AssignStmtNode(ASTNode):
+    def __init__(self, target_expr: ASTNode, value_expr: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.target_expr = target_expr
+        self.value_expr = value_expr
+
+class AsmBlockNode(ASTNode):
+    def __init__(self, instructions: List[str], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.instructions = instructions
+
+class WhileStmtNode(ASTNode):
+    def __init__(self, condition: ASTNode, body: List[ASTNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.condition = condition
+        self.body = body
+
+class IfStmtNode(ASTNode):
+    def __init__(self, condition: ASTNode, then_body: List[ASTNode],
+                 else_body: Optional[List[ASTNode]] = None, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.condition = condition
+        self.then_body = then_body
+        self.else_body = else_body
+
+class ReturnStmtNode(ASTNode):
+    def __init__(self, value_expr: Optional[ASTNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.value_expr = value_expr
+
+class ExprStmtNode(ASTNode):
+    def __init__(self, expr: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.expr = expr
+
+class BinaryOpNode(ASTNode):
+    def __init__(self, left: ASTNode, op: str, right: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.left = left
+        self.op = op
+        self.right = right
+
+class UnaryOpNode(ASTNode):
+    def __init__(self, op: str, operand: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.op = op
+        self.operand = operand
+
+class CastExprNode(ASTNode):
+    def __init__(self, expr: ASTNode, target_type: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.expr = expr
+        self.target_type = target_type
+
+class MemberAccessNode(ASTNode):
+    def __init__(self, target: ASTNode, member: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.target = target
+        self.member = member
+
+class CallExprNode(ASTNode):
+    def __init__(self, callee: ASTNode, args: List[ASTNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.callee = callee
+        self.args = args
+
+class IdentifierNode(ASTNode):
+    def __init__(self, name: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+
+class LiteralNode(ASTNode):
+    def __init__(self, value: Any, raw_type: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.value = value
+        self.raw_type = raw_type
+
+
+# ============================================================================
+# 3. Recursive Descent Parser
+# ============================================================================
 
 class Parser:
     def __init__(self, tokens: List[Token]):
         self.tokens = tokens
         self.pos = 0
-        self.lambda_id = 0
 
-    def peek(self) -> Token: return self.tokens[self.pos]
-    def advance(self) -> Token:
-        tok = self.peek()
-        if tok.type != TokenType.EOF: self.pos += 1
+    def _peek(self, offset: int = 0) -> Token:
+        idx = self.pos + offset
+        if idx >= len(self.tokens):
+            return self.tokens[-1]
+        return self.tokens[idx]
+
+    def _check(self, type_: str) -> bool:
+        return self._peek().type == type_
+
+    def _match(self, *types: str) -> bool:
+        if self._peek().type in types:
+            self.pos += 1
+            return True
+        return False
+
+    def _consume(self, type_: str, error_msg: str = "") -> Token:
+        tok = self._peek()
+        if tok.type != type_:
+            msg = error_msg or f"Expected token {type_}, got {tok.type} ('{tok.value}') at L{tok.line}:C{tok.col}"
+            raise SyntaxError(msg)
+        self.pos += 1
         return tok
-    def match(self, *types: TokenType) -> bool:
-        if self.peek().type in types: self.advance(); return True
-        return False
-    def consume(self, t: TokenType, msg: str) -> Token:
-        if self.peek().type == t: return self.advance()
-        raise SyntaxError(f"Line {self.peek().line}: {msg}. Got '{self.peek().value}'")
-    def skip_newlines(self):
-        while self.match(TokenType.NEWLINE): pass
 
-    def parse(self) -> Program:
-        imports, enums, structs, classes = [], [], [], []
-        self.skip_newlines()
-        while self.peek().type != TokenType.EOF:
-            if self.peek().type in (TokenType.IMPORT, TokenType.FROM):
-                imports.append(self.parse_import())
-            elif self.peek().type == TokenType.ENUM:
-                enums.append(self.parse_enum())
-            elif self.peek().type == TokenType.STRUCT:
-                structs.append(self.parse_struct())
-            elif self.peek().type == TokenType.CLASS:
-                classes.append(self.parse_class())
-            elif self.peek().type in (TokenType.DEF, TokenType.STATIC):
-                fn_token = self.peek()
-                next_val = self.tokens[self.pos + 1].value if self.pos + 1 < len(self.tokens) else "method"
-                raise SyntaxError(
-                    f"Line {fn_token.line}: Standalone functions are forbidden in Spike. "
-                    f"Spike is purely object-oriented; encapsulate '{next_val}' inside a class."
-                )
-            else:
-                tok = self.peek()
-                raise SyntaxError(f"Line {tok.line}: Expected class, struct, enum, or import; got '{tok.value}'")
-            self.skip_newlines()
-        return Program(imports=imports, enums=enums, structs=structs, classes=classes)
+    def parse(self) -> ProgramNode:
+        declarations: List[ASTNode] = []
+        start_tok = self._peek()
+        while not self._check(TokenType.EOF):
+            declarations.append(self._parse_top_level_declaration())
+        return ProgramNode(declarations, line=start_tok.line, col=start_tok.col)
 
-    def parse_import(self) -> ImportStmt:
-        if self.match(TokenType.FROM):
-            mod_path = [self.consume(TokenType.IDENT, "Expected module name").value]
-            while self.match(TokenType.DOT): mod_path.append(self.consume(TokenType.IDENT, "Expected module part").value)
-            self.consume(TokenType.IMPORT, "Expected 'import'")
-            syms = [self.consume(TokenType.IDENT, "Expected symbol").value]
-            while self.match(TokenType.COMMA): syms.append(self.consume(TokenType.IDENT, "Expected symbol").value)
-            return ImportStmt(module_path=mod_path, symbols=syms)
+    def _parse_top_level_declaration(self) -> ASTNode:
+        if self._check(TokenType.CONST):
+            return self._parse_const_declaration()
+        elif self._check(TokenType.STRUCT):
+            return self._parse_struct_declaration()
+        elif self._check(TokenType.CLASS):
+            return self._parse_class_declaration()
         else:
-            self.consume(TokenType.IMPORT, "Expected 'import'")
-            mod_path = [self.consume(TokenType.IDENT, "Expected module name").value]
-            while self.match(TokenType.DOT): mod_path.append(self.consume(TokenType.IDENT, "Expected module part").value)
-            return ImportStmt(module_path=mod_path, symbols=None)
+            tok = self._peek()
+            raise SyntaxError(f"Unexpected top-level token: {tok.type} ('{tok.value}') at L{tok.line}:C{tok.col}")
 
-    def parse_enum(self) -> EnumDecl:
-        self.consume(TokenType.ENUM, "Expected 'enum'")
-        name = self.consume(TokenType.IDENT, "Expected enum name").value
-        self.consume(TokenType.LBRACE, "Expected '{'")
-        self.skip_newlines(); self.consume(TokenType.INDENT, "Expected indent"); self.skip_newlines()
-        members = []
-        cur_val = 0
-        while self.peek().type not in (TokenType.DEDENT, TokenType.EOF):
-            mname = self.consume(TokenType.IDENT, "Expected enum member name").value
-            if self.match(TokenType.ASSIGN):
-                cur_val = self.consume(TokenType.INT_LIT, "Expected integer enum value").value
-            members.append(EnumMember(name=mname, value=cur_val))
-            cur_val += 1
-            self.skip_newlines()
-        self.consume(TokenType.DEDENT, "Expected dedent")
-        self.skip_newlines(); self.consume(TokenType.RBRACE, "Expected '}'")
-        return EnumDecl(name=name, members=members)
+    def _parse_const_declaration(self) -> ConstDeclNode:
+        start_tok = self._consume(TokenType.CONST)
+        name_tok = self._consume(TokenType.IDENTIFIER)
+        self._consume(TokenType.COLON)
+        var_type = self._parse_type()
+        self._consume(TokenType.EQUALS)
+        value_expr = self._parse_expression()
+        self._match(TokenType.SEMICOLON)
+        return ConstDeclNode(name_tok.value, var_type, value_expr, line=start_tok.line, col=start_tok.col)
 
-    # Structs are strictly pure data - methods are rejected
-    def parse_struct(self) -> StructDecl:
-        self.consume(TokenType.STRUCT, "Expected 'struct'")
-        name = self.consume(TokenType.IDENT, "Expected struct name").value
-        self.consume(TokenType.LBRACE, "Expected '{'")
-        self.skip_newlines(); self.consume(TokenType.INDENT, "Expected indent"); self.skip_newlines()
-        fields = []
-        while self.peek().type not in (TokenType.DEDENT, TokenType.EOF):
-            if self.peek().type in (TokenType.DEF, TokenType.STATIC):
-                raise SyntaxError(
-                    f"Line {self.peek().line}: Struct '{name}' cannot contain methods. "
-                    f"Structs are strictly pure-data value types. Use a class for methods and behaviors."
-                )
-            fn = self.consume(TokenType.IDENT, "Expected field name").value
-            self.consume(TokenType.COLON, "Expected ':'")
-            ft = self.parse_type_annotation()
-            dflt = self.parse_expression() if self.match(TokenType.ASSIGN) else None
-            fields.append(FieldDecl(name=fn, type_name=ft, default_value=dflt))
-            self.skip_newlines()
-        self.consume(TokenType.DEDENT, "Expected dedent")
-        self.skip_newlines(); self.consume(TokenType.RBRACE, "Expected '}'")
-        return StructDecl(name=name, fields=fields)
+    def _parse_struct_declaration(self) -> StructDeclNode:
+        start_tok = self._consume(TokenType.STRUCT)
+        name_tok = self._consume(TokenType.IDENTIFIER)
+        self._consume(TokenType.LBRACE)
+        fields: List[StructFieldNode] = []
 
-    def parse_class(self) -> ClassDecl:
-        self.consume(TokenType.CLASS, "Expected 'class'")
-        name = self.consume(TokenType.IDENT, "Expected class name").value
-        parent = None
-        if self.match(TokenType.LPAREN):
-            parent = self.consume(TokenType.IDENT, "Expected parent class").value
-            self.consume(TokenType.RPAREN, "Expected ')'")
-        self.consume(TokenType.LBRACE, "Expected '{'")
-        self.skip_newlines(); self.consume(TokenType.INDENT, "Expected indent"); self.skip_newlines()
-        fields, methods = [], []
-        while self.peek().type not in (TokenType.DEDENT, TokenType.EOF):
-            if self.peek().type in (TokenType.DEF, TokenType.STATIC, TokenType.EXTERN, TokenType.EXPORT):
-                methods.append(self.parse_method())
-            else:
-                fn = self.consume(TokenType.IDENT, "Expected field name").value
-                self.consume(TokenType.COLON, "Expected ':'")
-                ft = self.parse_type_annotation()
-                dflt = self.parse_expression() if self.match(TokenType.ASSIGN) else None
-                fields.append(FieldDecl(name=fn, type_name=ft, default_value=dflt))
-            self.skip_newlines()
-        self.consume(TokenType.DEDENT, "Expected dedent")
-        self.skip_newlines(); self.consume(TokenType.RBRACE, "Expected '}'")
-        return ClassDecl(name=name, parent_name=parent, fields=fields, methods=methods)
+        while not self._check(TokenType.RBRACE) and not self._check(TokenType.EOF):
+            fname_tok = self._consume(TokenType.IDENTIFIER)
+            self._consume(TokenType.COLON)
+            ftype = self._parse_type()
+            self._match(TokenType.COMMA)
+            self._match(TokenType.SEMICOLON)
+            fields.append(StructFieldNode(fname_tok.value, ftype, line=fname_tok.line, col=fname_tok.col))
 
-    def parse_type_annotation(self) -> str:
-        if self.match(TokenType.STAR):
-            return f"*{self.parse_type_annotation()}"
-        if self.match(TokenType.LBRACKET):
-            inner = self.parse_type_annotation()
-            if self.match(TokenType.SEMICOLON):
-                size = self.consume(TokenType.INT_LIT, "Expected array size").value
-                self.consume(TokenType.RBRACKET, "Expected ']'")
-                return f"array<{inner},{size}>"
-            self.consume(TokenType.RBRACKET, "Expected ']'")
-            return f"slice<{inner}>"
-        if self.match(TokenType.LPAREN):
-            types = [self.parse_type_annotation()]
-            while self.match(TokenType.COMMA): types.append(self.parse_type_annotation())
-            self.consume(TokenType.RPAREN, "Expected ')'")
-            return f"tuple<{','.join(types)}>"
-        return self.consume(TokenType.IDENT, "Expected type name").value
+        self._consume(TokenType.RBRACE)
+        return StructDeclNode(name_tok.value, fields, line=start_tok.line, col=start_tok.col)
 
-    def parse_method(self) -> MethodDecl:
-        is_static = self.match(TokenType.STATIC)
-        is_ext = self.match(TokenType.EXTERN)
-        is_exp = self.match(TokenType.EXPORT)
-        self.consume(TokenType.DEF, "Expected 'def'")
-        name = self.consume(TokenType.IDENT, "Expected method name").value
-        self.consume(TokenType.LPAREN, "Expected '('")
-        params = []
-        if self.peek().type != TokenType.RPAREN:
+    def _parse_class_declaration(self) -> ClassDeclNode:
+        start_tok = self._consume(TokenType.CLASS)
+        name_tok = self._consume(TokenType.IDENTIFIER)
+        self._consume(TokenType.LBRACE)
+        methods: List[MethodDeclNode] = []
+
+        while not self._check(TokenType.RBRACE) and not self._check(TokenType.EOF):
+            is_export = self._match(TokenType.EXPORT)
+            is_static = self._match(TokenType.STATIC)
+            if not is_export and self._match(TokenType.EXPORT):
+                is_export = True
+
+            methods.append(self._parse_method_declaration(is_static, is_export))
+
+        self._consume(TokenType.RBRACE)
+        return ClassDeclNode(name_tok.value, methods, line=start_tok.line, col=start_tok.col)
+
+    def _parse_method_declaration(self, is_static: bool, is_export: bool) -> MethodDeclNode:
+        start_tok = self._consume(TokenType.DEF)
+        name_tok = self._consume(TokenType.IDENTIFIER)
+        self._consume(TokenType.LPAREN)
+
+        params: List[tuple[str, str]] = []
+        if not self._check(TokenType.RPAREN):
             while True:
-                pn = self.consume(TokenType.IDENT, "Expected param name").value
-                self.consume(TokenType.COLON, "Expected ':'")
-                pt = self.parse_type_annotation()
-                dflt = self.parse_expression() if self.match(TokenType.ASSIGN) else None
-                params.append(Param(name=pn, type_name=pt, default_value=dflt))
-                if not self.match(TokenType.COMMA): break
-        self.consume(TokenType.RPAREN, "Expected ')'")
-        ret_t = self.parse_type_annotation() if self.match(TokenType.COLON) else None
-        body = self.parse_block() if not is_ext else None
-        return MethodDecl(name=name, params=params, return_type=ret_t, body=body, is_static=is_static, is_extern=is_ext, is_export=is_exp)
+                pname = self._consume(TokenType.IDENTIFIER).value
+                self._consume(TokenType.COLON)
+                ptype = self._parse_type()
+                params.append((pname, ptype))
+                if not self._match(TokenType.COMMA):
+                    break
 
-    def parse_block(self) -> List[Stmt]:
-        self.consume(TokenType.LBRACE, "Expected '{'")
-        self.skip_newlines(); self.consume(TokenType.INDENT, "Expected indent"); self.skip_newlines()
-        stmts = []
-        while self.peek().type not in (TokenType.DEDENT, TokenType.EOF):
-            stmts.append(self.parse_statement())
-            self.skip_newlines()
-        self.consume(TokenType.DEDENT, "Expected dedent")
-        self.skip_newlines(); self.consume(TokenType.RBRACE, "Expected '}'")
-        return stmts
+        self._consume(TokenType.RPAREN)
 
-    def parse_statement(self) -> Stmt:
-        if self.match(TokenType.RETURN):
-            val = None if self.peek().type in (TokenType.NEWLINE, TokenType.RBRACE, TokenType.DEDENT) else self.parse_expression()
-            return ReturnStmt(value=val)
-        if self.match(TokenType.BREAK): return BreakStmt()
-        if self.match(TokenType.CONTINUE): return ContinueStmt()
-        if self.match(TokenType.IF): return self.parse_if()
-        if self.match(TokenType.WHILE): return self.parse_while()
-        if self.match(TokenType.FOR): return self.parse_for()
-        if self.match(TokenType.ASM): return self.parse_asm_stmt()
-        if self.match(TokenType.TRY): return self.parse_try()
-        if self.match(TokenType.RAISE): return RaiseStmt(exception=self.parse_expression())
-        if self.match(TokenType.DISOWN): return DisownStmt(target=self.parse_expression())
-        if self.match(TokenType.OWN): return OwnStmt(target=self.parse_expression())
+        return_type = "none"
+        if self._match(TokenType.COLON) or self._match(TokenType.ARROW):
+            return_type = self._parse_type()
 
-        # Unpack / Colon-based Declaration / Assignment
-        if self.check_unpack_decl(): return self.parse_unpack_decl()
-        if self.check_var_decl(): return self.parse_var_decl()
+        self._consume(TokenType.LBRACE)
+        body = self._parse_block()
+        self._consume(TokenType.RBRACE)
 
-        expr = self.parse_expression()
-        for assign_op in (TokenType.ASSIGN, TokenType.PLUS_ASSIGN, TokenType.MINUS_ASSIGN, TokenType.STAR_ASSIGN, TokenType.SLASH_ASSIGN):
-            if self.match(assign_op):
-                val = self.parse_expression()
-                return AssignStmt(target=expr, op=assign_op.value, value=val)
-        return ExprStmt(expr=expr)
+        return MethodDeclNode(
+            name_tok.value, params, return_type, body,
+            is_static=is_static, is_export=is_export,
+            line=start_tok.line, col=start_tok.col
+        )
 
-    def check_unpack_decl(self) -> bool:
-        if self.peek().type != TokenType.LPAREN: return False
-        i = self.pos + 1
-        while i < len(self.tokens) and self.tokens[i].type != TokenType.RPAREN:
-            if self.tokens[i].type == TokenType.COLON: return True
-            i += 1
-        return False
+    def _parse_block(self) -> List[ASTNode]:
+        statements: List[ASTNode] = []
+        while not self._check(TokenType.RBRACE) and not self._check(TokenType.EOF):
+            statements.append(self._parse_statement())
+        return statements
 
-    def parse_unpack_decl(self) -> UnpackVarDeclStmt:
-        self.consume(TokenType.LPAREN, "Expected '('")
-        names, types = [], []
+    def _parse_statement(self) -> ASTNode:
+        if self._check(TokenType.ASM):
+            return self._parse_asm_statement()
+        elif self._check(TokenType.WHILE):
+            return self._parse_while_statement()
+        elif self._check(TokenType.IF):
+            return self._parse_if_statement()
+        elif self._check(TokenType.RETURN):
+            return self._parse_return_statement()
+        
+        # Explicit Type Declaration: `name: Type = expr;`
+        elif self._check(TokenType.IDENTIFIER) and self._peek(1).type == TokenType.COLON:
+            name_tok = self._consume(TokenType.IDENTIFIER)
+            self._consume(TokenType.COLON)
+            var_type = self._parse_type()
+            self._consume(TokenType.EQUALS)
+            val = self._parse_expression()
+            self._match(TokenType.SEMICOLON)
+            return VarDeclNode(name_tok.value, var_type, val, line=name_tok.line, col=name_tok.col)
+
+        # Assignment statement (target = expr)
+        else:
+            expr = self._parse_expression()
+            if self._match(TokenType.EQUALS):
+                val = self._parse_expression()
+                self._match(TokenType.SEMICOLON)
+                return AssignStmtNode(expr, val, line=expr.line, col=expr.col)
+            self._match(TokenType.SEMICOLON)
+            return ExprStmtNode(expr, line=expr.line, col=expr.col)
+
+    def _parse_asm_statement(self) -> AsmBlockNode:
+        start_tok = self._consume(TokenType.ASM)
+        self._consume(TokenType.LBRACE)
+        instructions: List[str] = []
+
+        while not self._check(TokenType.RBRACE) and not self._check(TokenType.EOF):
+            token = self._consume(TokenType.STRING_LITERAL)
+            raw_text = str(token.value)
+            for part in raw_text.split(";"):
+                clean = part.strip()
+                if clean:
+                    instructions.append(clean)
+            self._match(TokenType.SEMICOLON)
+
+        self._consume(TokenType.RBRACE)
+        return AsmBlockNode(instructions, line=start_tok.line, col=start_tok.col)
+
+    def _parse_while_statement(self) -> WhileStmtNode:
+        start_tok = self._consume(TokenType.WHILE)
+        condition = self._parse_expression()
+        self._consume(TokenType.LBRACE)
+        body = self._parse_block()
+        self._consume(TokenType.RBRACE)
+        return WhileStmtNode(condition, body, line=start_tok.line, col=start_tok.col)
+
+    def _parse_if_statement(self) -> IfStmtNode:
+        start_tok = self._consume(TokenType.IF)
+        cond = self._parse_expression()
+        self._consume(TokenType.LBRACE)
+        then_body = self._parse_block()
+        self._consume(TokenType.RBRACE)
+
+        else_body = None
+        if self._match(TokenType.ELSE):
+            self._consume(TokenType.LBRACE)
+            else_body = self._parse_block()
+            self._consume(TokenType.RBRACE)
+
+        return IfStmtNode(cond, then_body, else_body, line=start_tok.line, col=start_tok.col)
+
+    def _parse_return_statement(self) -> ReturnStmtNode:
+        start_tok = self._consume(TokenType.RETURN)
+        val = None
+        if not self._check(TokenType.SEMICOLON) and not self._check(TokenType.RBRACE):
+            val = self._parse_expression()
+        self._match(TokenType.SEMICOLON)
+        return ReturnStmtNode(val, line=start_tok.line, col=start_tok.col)
+
+    def _parse_type(self) -> str:
+        if self._match(TokenType.STAR):
+            qualifier = ""
+            if self._peek().type == TokenType.IDENTIFIER and self._peek().value in ("mut", "const"):
+                qualifier = self._advance_token().value + " "
+            base_type = self._parse_type()
+            return f"*{qualifier}{base_type}"
+
+        tok = self._consume(TokenType.IDENTIFIER)
+        return tok.value
+
+    def _advance_token(self) -> Token:
+        tok = self._peek()
+        self.pos += 1
+        return tok
+
+    def _parse_expression(self) -> ASTNode:
+        return self._parse_cast_expression()
+
+    def _parse_cast_expression(self) -> ASTNode:
+        expr = self._parse_comparison()
+        while self._match(TokenType.AS):
+            target_type = self._parse_type()
+            expr = CastExprNode(expr, target_type, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_comparison(self) -> ASTNode:
+        expr = self._parse_additive()
+        while self._peek().type in (TokenType.LT, TokenType.GT, TokenType.LE, TokenType.GE, TokenType.EQ, TokenType.NE):
+            op_tok = self._advance_token()
+            right = self._parse_additive()
+            expr = BinaryOpNode(expr, op_tok.value, right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_additive(self) -> ASTNode:
+        expr = self._parse_multiplicative()
+        while self._peek().type in (TokenType.PLUS, TokenType.MINUS):
+            op_tok = self._advance_token()
+            right = self._parse_multiplicative()
+            expr = BinaryOpNode(expr, op_tok.value, right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_multiplicative(self) -> ASTNode:
+        expr = self._parse_unary()
+        while self._peek().type in (TokenType.STAR, TokenType.SLASH, TokenType.PERCENT):
+            op_tok = self._advance_token()
+            right = self._parse_unary()
+            expr = BinaryOpNode(expr, op_tok.value, right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_unary(self) -> ASTNode:
+        if self._peek().type in (TokenType.STAR, TokenType.BANG, TokenType.MINUS):
+            op_tok = self._advance_token()
+            operand = self._parse_unary()
+            return UnaryOpNode(op_tok.value, operand, line=op_tok.line, col=op_tok.col)
+        return self._parse_postfix()
+
+    def _parse_postfix(self) -> ASTNode:
+        expr = self._parse_primary()
         while True:
-            names.append(self.consume(TokenType.IDENT, "Expected name").value)
-            self.consume(TokenType.COLON, "Expected ':'")
-            types.append(self.parse_type_annotation())
-            if not self.match(TokenType.COMMA): break
-        self.consume(TokenType.RPAREN, "Expected ')'")
-        self.consume(TokenType.ASSIGN, "Expected '='")
-        init = self.parse_expression()
-        return UnpackVarDeclStmt(names=names, type_names=types, initializer=init)
-
-    def check_var_decl(self) -> bool:
-        if self.peek().type == TokenType.IDENT:
-            if self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == TokenType.COLON:
-                return True
-        return False
-
-    def parse_var_decl(self) -> VarDeclStmt:
-        name = self.consume(TokenType.IDENT, "Expected variable name").value
-        self.consume(TokenType.COLON, "Expected ':'")
-        tname = self.parse_type_annotation()
-        init = self.parse_expression() if self.match(TokenType.ASSIGN) else None
-        return VarDeclStmt(name=name, type_name=tname, initializer=init)
-
-    def parse_if(self) -> IfStmt:
-        cond = self.parse_expression()
-        then_b = self.parse_block()
-        else_b = None
-        self.skip_newlines()
-        if self.match(TokenType.ELSE): else_b = self.parse_block()
-        return IfStmt(condition=cond, then_body=then_b, else_body=else_b)
-
-    def parse_while(self) -> WhileStmt:
-        cond = self.parse_expression()
-        body = self.parse_block()
-        return WhileStmt(condition=cond, body=body)
-
-    def parse_for(self) -> ForRangeStmt:
-        vname = self.consume(TokenType.IDENT, "Expected loop variable").value
-        self.consume(TokenType.IN, "Expected 'in'")
-        self.consume(TokenType.IDENT, "Expected 'range'")
-        self.consume(TokenType.LPAREN, "Expected '('")
-        start = self.parse_expression()
-        self.consume(TokenType.COMMA, "Expected ','")
-        stop = self.parse_expression()
-        step = self.parse_expression() if self.match(TokenType.COMMA) else IntLiteral(1)
-        self.consume(TokenType.RPAREN, "Expected ')'")
-        body = self.parse_block()
-        return ForRangeStmt(var_name=vname, start=start, stop=stop, step=step, body=body)
-
-    def parse_try(self) -> TryStmt:
-        body = self.parse_block()
-        handlers = []
-        self.skip_newlines()
-        while self.match(TokenType.EXCEPT):
-            vname = None
-            if self.peek().type == TokenType.IDENT and self.tokens[self.pos+1].type == TokenType.COLON:
-                vname = self.advance().value
-                self.consume(TokenType.COLON, "Expected ':'")
-            exc_t = self.consume(TokenType.IDENT, "Expected exception type").value
-            h_body = self.parse_block()
-            handlers.append(ExceptHandler(var_name=vname, exc_type=exc_t, body=h_body))
-            self.skip_newlines()
-        finally_b = self.parse_block() if self.match(TokenType.FINALLY) else None
-        return TryStmt(body=body, handlers=handlers, finally_body=finally_b)
-
-    def parse_asm_stmt(self) -> AsmStmt:
-        self.consume(TokenType.LBRACE, "Expected '{'")
-        self.skip_newlines(); self.consume(TokenType.INDENT, "Expected indent"); self.skip_newlines()
-        template = self.consume(TokenType.STRING_LIT, "Expected assembly template").value
-        self.skip_newlines()
-        outputs, inputs, clobbers = [], [], []
-        if self.match(TokenType.COLON):
-            outputs = self.parse_asm_operands()
-            self.skip_newlines()
-            if self.match(TokenType.COLON):
-                inputs = self.parse_asm_operands()
-                self.skip_newlines()
-                if self.match(TokenType.COLON):
+            if self._match(TokenType.DOT):
+                member_tok = self._consume(TokenType.IDENTIFIER)
+                expr = MemberAccessNode(expr, member_tok.value, line=expr.line, col=expr.col)
+            elif self._match(TokenType.LPAREN):
+                args: List[ASTNode] = []
+                if not self._check(TokenType.RPAREN):
                     while True:
-                        clobbers.append(self.consume(TokenType.STRING_LIT, "Expected clobber").value)
-                        if not self.match(TokenType.COMMA): break
-                    self.skip_newlines()
-        self.consume(TokenType.DEDENT, "Expected dedent")
-        self.skip_newlines(); self.consume(TokenType.RBRACE, "Expected '}'")
-        return AsmStmt(template=template, outputs=outputs, inputs=inputs, clobbers=clobbers)
-
-    def parse_asm_operands(self) -> List[AsmConstraint]:
-        operands = []
-        if self.peek().type in (TokenType.COLON, TokenType.DEDENT, TokenType.RBRACE): return operands
-        while True:
-            c = self.consume(TokenType.STRING_LIT, "Expected constraint string").value
-            self.consume(TokenType.LPAREN, "Expected '('")
-            v = self.parse_expression()
-            self.consume(TokenType.RPAREN, "Expected ')'")
-            operands.append(AsmConstraint(constraint=c, variable=v))
-            if not self.match(TokenType.COMMA): break
-        return operands
-
-    def parse_expression(self) -> Expr: return self.parse_logical_or()
-
-    def parse_logical_or(self) -> Expr:
-        expr = self.parse_logical_and()
-        while self.match(TokenType.OR): expr = BinaryExpr(left=expr, op="||", right=self.parse_logical_and())
-        return expr
-
-    def parse_logical_and(self) -> Expr:
-        expr = self.parse_bitwise_or()
-        while self.match(TokenType.AND): expr = BinaryExpr(left=expr, op="&&", right=self.parse_bitwise_or())
-        return expr
-
-    def parse_bitwise_or(self) -> Expr:
-        expr = self.parse_bitwise_xor()
-        while self.match(TokenType.PIPE): expr = BinaryExpr(left=expr, op="|", right=self.parse_bitwise_xor())
-        return expr
-
-    def parse_bitwise_xor(self) -> Expr:
-        expr = self.parse_bitwise_and()
-        while self.match(TokenType.CARET): expr = BinaryExpr(left=expr, op="^", right=self.parse_bitwise_and())
-        return expr
-
-    def parse_bitwise_and(self) -> Expr:
-        expr = self.parse_equality()
-        while self.match(TokenType.AMPERSAND): expr = BinaryExpr(left=expr, op="&", right=self.parse_equality())
-        return expr
-
-    def parse_equality(self) -> Expr:
-        expr = self.parse_relational()
-        while self.match(TokenType.EQ, TokenType.NEQ, TokenType.IS):
-            op = self.tokens[self.pos - 1]
-            if op.type == TokenType.IS:
-                t_name = self.consume(TokenType.IDENT, "Expected type name after 'is'").value
-                expr = TypeCheckExpr(target=expr, type_name=t_name)
-            else:
-                expr = BinaryExpr(left=expr, op=op.value, right=self.parse_relational())
-        return expr
-
-    def parse_relational(self) -> Expr:
-        expr = self.parse_shift()
-        while self.match(TokenType.LT, TokenType.GT, TokenType.LTE, TokenType.GTE, TokenType.AS):
-            op = self.tokens[self.pos - 1]
-            if op.type == TokenType.AS:
-                t_name = self.parse_type_annotation()
-                expr = CastExpr(target=expr, to_type=t_name)
-            else:
-                expr = BinaryExpr(left=expr, op=op.value, right=self.parse_shift())
-        return expr
-
-    def parse_shift(self) -> Expr:
-        expr = self.parse_additive()
-        while self.match(TokenType.SHL, TokenType.SHR):
-            op = self.tokens[self.pos - 1].value
-            expr = BinaryExpr(left=expr, op=op, right=self.parse_additive())
-        return expr
-
-    def parse_additive(self) -> Expr:
-        expr = self.parse_multiplicative()
-        while self.match(TokenType.PLUS, TokenType.MINUS):
-            op = self.tokens[self.pos - 1].value
-            expr = BinaryExpr(left=expr, op=op, right=self.parse_multiplicative())
-        return expr
-
-    def parse_multiplicative(self) -> Expr:
-        expr = self.parse_unary()
-        while self.match(TokenType.STAR, TokenType.SLASH, TokenType.PERCENT):
-            op = self.tokens[self.pos - 1].value
-            expr = BinaryExpr(left=expr, op=op, right=self.parse_unary())
-        return expr
-
-    def parse_unary(self) -> Expr:
-        if self.match(TokenType.STAR, TokenType.AMPERSAND, TokenType.MINUS, TokenType.TILDE, TokenType.NOT):
-            op = self.tokens[self.pos - 1].value
-            c_op = "!" if op == "not" else op
-            return UnaryExpr(op=c_op, right=self.parse_unary())
-        return self.parse_postfix()
-
-    def parse_postfix(self) -> Expr:
-        expr = self.parse_primary()
-        while True:
-            if self.match(TokenType.DOT):
-                m = self.consume(TokenType.IDENT, "Expected member name").value
-                expr = MemberAccessExpr(target=expr, member=m)
-            elif self.match(TokenType.LBRACKET):
-                first = self.parse_expression()
-                if self.match(TokenType.COLON):
-                    end = self.parse_expression()
-                    self.consume(TokenType.RBRACKET, "Expected ']'")
-                    expr = SliceExpr(target=expr, start=first, end=end)
-                else:
-                    self.consume(TokenType.RBRACKET, "Expected ']'")
-                    expr = IndexAccessExpr(target=expr, index=first)
-            elif self.match(TokenType.LPAREN):
-                pos_args, named_args = [], []
-                if self.peek().type != TokenType.RPAREN:
-                    while True:
-                        if self.peek().type == TokenType.IDENT and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1].type == TokenType.ASSIGN:
-                            aname = self.advance().value
-                            self.advance()
-                            named_args.append(NamedArg(name=aname, value=self.parse_expression()))
-                        else:
-                            pos_args.append(self.parse_expression())
-                        if not self.match(TokenType.COMMA): break
-                self.consume(TokenType.RPAREN, "Expected ')'")
-                expr = CallExpr(callee=expr, args=pos_args, named_args=named_args)
+                        args.append(self._parse_expression())
+                        if not self._match(TokenType.COMMA):
+                            break
+                self._consume(TokenType.RPAREN)
+                expr = CallExprNode(expr, args, line=expr.line, col=expr.col)
             else:
                 break
         return expr
 
-    def parse_primary(self) -> Expr:
-        if self._is_lambda(): return self._parse_lambda()
-        if self.match(TokenType.SIZEOF):
-            self.consume(TokenType.LPAREN, "Expected '('")
-            tname = self.parse_type_annotation()
-            self.consume(TokenType.RPAREN, "Expected ')'")
-            return SizeofExpr(type_name=tname)
-        if self.match(TokenType.LEN):
-            self.consume(TokenType.LPAREN, "Expected '('")
-            target = self.parse_expression()
-            self.consume(TokenType.RPAREN, "Expected ')'")
-            return LenExpr(target=target)
-        if self.match(TokenType.LBRACKET):
-            elems = []
-            if self.peek().type != TokenType.RBRACKET:
-                while True:
-                    elems.append(self.parse_expression())
-                    if not self.match(TokenType.COMMA): break
-            self.consume(TokenType.RBRACKET, "Expected ']'")
-            return ListLiteral(elements=elems)
-        if self.match(TokenType.MANUAL):
-            cls = self.consume(TokenType.IDENT, "Expected class name").value
-            self.consume(TokenType.LPAREN, "Expected '('")
-            args = []
-            if self.peek().type != TokenType.RPAREN:
-                while True:
-                    args.append(self.parse_expression())
-                    if not self.match(TokenType.COMMA): break
-            self.consume(TokenType.RPAREN, "Expected ')'")
-            return ManualAllocExpr(class_name=cls, args=args)
-        if self.match(TokenType.LPAREN):
-            first = self.parse_expression()
-            if self.match(TokenType.COMMA):
-                elems = [first]
-                while True:
-                    elems.append(self.parse_expression())
-                    if not self.match(TokenType.COMMA): break
-                self.consume(TokenType.RPAREN, "Expected ')'")
-                return TupleLiteral(elements=elems)
-            self.consume(TokenType.RPAREN, "Expected ')'")
-            return first
+    def _parse_primary(self) -> ASTNode:
+        tok = self._peek()
+        if self._match(TokenType.INT_LITERAL, TokenType.HEX_LITERAL):
+            return LiteralNode(tok.value, "int", line=tok.line, col=tok.col)
+        elif self._match(TokenType.STRING_LITERAL):
+            return LiteralNode(tok.value, "string", line=tok.line, col=tok.col)
+        elif self._match(TokenType.TRUE):
+            return LiteralNode(True, "bool", line=tok.line, col=tok.col)
+        elif self._match(TokenType.FALSE):
+            return LiteralNode(False, "bool", line=tok.line, col=tok.col)
+        elif self._match(TokenType.IDENTIFIER):
+            return IdentifierNode(tok.value, line=tok.line, col=tok.col)
+        elif self._match(TokenType.LPAREN):
+            inner = self._parse_expression()
+            self._consume(TokenType.RPAREN)
+            return inner
+        else:
+            raise SyntaxError(f"Unexpected token in expression: {tok.type} ('{tok.value}') at L{tok.line}:C{tok.col}")
 
-        if self.match(TokenType.INT_LIT): return IntLiteral(value=self.tokens[self.pos - 1].value)
-        if self.match(TokenType.FLOAT_LIT): return FloatLiteral(value=self.tokens[self.pos - 1].value)
-        if self.match(TokenType.STRING_LIT): return StringLiteral(value=self.tokens[self.pos - 1].value)
-        if self.match(TokenType.BOOL_LIT): return BoolLiteral(value=self.tokens[self.pos - 1].value)
-        if self.match(TokenType.IDENT): return Identifier(name=self.tokens[self.pos - 1].value)
 
-        tok = self.peek()
-        raise SyntaxError(f"Line {tok.line}: Unexpected token '{tok.value}'")
-
-    def _is_lambda(self) -> bool:
-        if self.peek().type != TokenType.LPAREN: return False
-        idx = self.pos + 1; depth = 1
-        while idx < len(self.tokens) and depth > 0:
-            if self.tokens[idx].type == TokenType.LPAREN: depth += 1
-            elif self.tokens[idx].type == TokenType.RPAREN: depth -= 1
-            idx += 1
-        if idx < len(self.tokens) and self.tokens[idx].type == TokenType.COLON: idx += 2
-        return idx < len(self.tokens) and self.tokens[idx].type == TokenType.ARROW
-
-    def _parse_lambda(self) -> LambdaExpr:
-        self.consume(TokenType.LPAREN, "Expected '('")
-        params = []
-        if self.peek().type != TokenType.RPAREN:
-            while True:
-                pn = self.consume(TokenType.IDENT, "Expected param").value
-                self.consume(TokenType.COLON, "Expected ':'")
-                pt = self.parse_type_annotation()
-                params.append(Param(name=pn, type_name=pt))
-                if not self.match(TokenType.COMMA): break
-        self.consume(TokenType.RPAREN, "Expected ')'")
-        ret_t = self.parse_type_annotation() if self.match(TokenType.COLON) else None
-        self.consume(TokenType.ARROW, "Expected '=>'")
-        body = self.parse_block()
-        self.lambda_id += 1
-        return LambdaExpr(params=params, return_type=ret_t, body=body, lambda_id=self.lambda_id)
-
-# =============================================================================
-# 4. C CODE GENERATOR
-# =============================================================================
+# ============================================================================
+# 4. C Code Generator (With Error Diagnostics & Pointer Dereferencing)
+# ============================================================================
 
 class CCodeGenerator:
     TYPE_MAP = {
-        "int": "int64_t", "u8": "uint8_t", "u16": "uint16_t",
-        "u32": "uint32_t", "u64": "uint64_t", "usize": "uintptr_t",
-        "float": "double", "bool": "bool", "String": "String*",
-        "List": "List*", "Tuple": "Tuple*", "Closure": "Closure*",
-        "Object": "Object*", "void": "void"
+        "u8": "uint8_t",
+        "u16": "uint16_t",
+        "u32": "uint32_t",
+        "u64": "uint64_t",
+        "i8": "int8_t",
+        "i16": "int16_t",
+        "i32": "int32_t",
+        "i64": "int64_t",
+        "bool": "bool",
+        "none": "void",
+        "void": "void",
+        "noreturn": "void",
     }
 
-    def __init__(self, ast: Program, module_name: str = "main"):
-        self.ast = ast
-        self.module_name = module_name
-        self.classes: Dict[str, ClassDecl] = {c.name: c for c in ast.classes}
-        self.structs: Dict[str, StructDecl] = {s.name: s for s in ast.structs}
-        self.enums: Dict[str, EnumDecl] = {e.name: e for e in ast.enums}
-        self.var_types: Dict[str, str] = {}
-        self.tuple_returns: Set[str] = set()
-        self._scan_tuple_returns()
+    def __init__(self, kernel_mode: bool = False):
+        self.kernel_mode = kernel_mode
+        self.output: List[str] = []
+        self.indent_level = 0
+        self.current_class: Optional[str] = None
+        self.struct_types: Set[str] = set()
+        self.class_types: Set[str] = set()
+        
+        # Symbol Table & Scoped Type System
+        self.declared_symbols: Set[str] = set()
+        self.symbol_types: Dict[str, str] = {}
 
-    def _scan_tuple_returns(self):
-        for c in self.ast.classes:
-            for m in c.methods:
-                if m.return_type and m.return_type.startswith("tuple<"):
-                    self.tuple_returns.add(m.return_type)
+    def _emit(self, line: str = ""):
+        indent = "    " * self.indent_level
+        self.output.append(f"{indent}{line}")
 
-    def c_type(self, t: Optional[str]) -> str:
-        if not t: return "void"
-        if t.startswith("*"): return f"{self.c_type(t[1:])}*"
-        if t.startswith("slice<"): return "Slice"
-        if t.startswith("array<"):
-            parts = t[6:-1].split(",")
-            return f"{self.c_type(parts[0])}"
-        if t.startswith("tuple<"):
-            inner = t[6:-1].replace(",", "_").replace("*", "ptr_")
-            return f"__SpikeTuple_{inner}"
-        if t in self.TYPE_MAP: return self.TYPE_MAP[t]
-        if t in self.classes: return f"{t}*"
-        if t in self.structs or t in self.enums: return t
-        return t
+    def map_type(self, spike_type: Optional[str]) -> str:
+        if not spike_type:
+            return "void"
 
-    def _format_params(self, container_name: str, m: MethodDecl) -> str:
+        spike_type = spike_type.strip()
+        if spike_type.startswith("*"):
+            clean = spike_type[1:].strip()
+            is_const = clean.startswith("const")
+            if is_const:
+                clean = clean[5:].strip()
+            elif clean.startswith("mut"):
+                clean = clean[3:].strip()
+            
+            c_base = self.map_type(clean)
+            return f"const {c_base}*" if is_const else f"{c_base}*"
+
+        if spike_type in self.TYPE_MAP:
+            return self.TYPE_MAP[spike_type]
+
+        if spike_type in self.struct_types:
+            return f"struct {spike_type}"
+
+        if spike_type in self.class_types:
+            return f"struct {spike_type}"
+
+        return spike_type
+
+    def infer_type(self, node: ASTNode) -> Optional[str]:
+        if isinstance(node, IdentifierNode):
+            return self.symbol_types.get(node.name)
+        if isinstance(node, CastExprNode):
+            return node.target_type
+        if isinstance(node, BinaryOpNode):
+            left_type = self.infer_type(node.left)
+            right_type = self.infer_type(node.right)
+            if left_type and left_type.startswith("*"):
+                return left_type
+            if right_type and right_type.startswith("*"):
+                return right_type
+            return left_type or right_type
+        if isinstance(node, UnaryOpNode):
+            if node.op == "*":
+                operand_type = self.infer_type(node.operand)
+                if operand_type and operand_type.startswith("*"):
+                    clean = operand_type[1:].strip()
+                    if clean.startswith("mut") or clean.startswith("const"):
+                        clean = clean.split(maxsplit=1)[1]
+                    return clean
+            return self.infer_type(node.operand)
+        return None
+
+    def is_pointer_type(self, node: ASTNode) -> bool:
+        t = self.infer_type(node)
+        return bool(t and t.strip().startswith("*"))
+
+    def generate(self, root: ProgramNode) -> str:
+        self.output.clear()
+
+        # 1. Header
+        if self.kernel_mode:
+            self._emit("/* Generated by Spike Compiler - Standalone Kernel Mode */")
+            self._emit("#include <stdint.h>")
+            self._emit("#include <stddef.h>")
+            self._emit("#include <stdbool.h>")
+            self._emit("")
+        else:
+            self._emit("/* Generated by Spike Compiler - User Space */")
+            self._emit('#include "spike_rt.h"')
+            self._emit("#include <stdint.h>")
+            self._emit("#include <stdbool.h>")
+            self._emit("")
+
+        # 2. Collect Struct & Class Names
+        for decl in root.declarations:
+            if isinstance(decl, StructDeclNode):
+                self.struct_types.add(decl.name)
+            elif isinstance(decl, ClassDeclNode):
+                self.class_types.add(decl.name)
+
+        # 3. Forward Struct & Class Declarations
+        for decl in root.declarations:
+            if isinstance(decl, StructDeclNode):
+                self._emit(f"struct {decl.name};")
+            elif isinstance(decl, ClassDeclNode):
+                self._emit(f"struct {decl.name} {{ int _dummy; }};")
+        if self.struct_types or self.class_types:
+            self._emit("")
+
+        # 4. Generate Code
+        for decl in root.declarations:
+            self._visit(decl)
+            self._emit("")
+
+        return "\n".join(self.output)
+
+    def _visit(self, node: ASTNode) -> str:
+        method_name = f"_visit_{type(node).__name__}"
+        visitor = getattr(self, method_name, self._generic_visit)
+        return visitor(node)
+
+    def _generic_visit(self, node: ASTNode):
+        raise NotImplementedError(f"No visitor defined for AST node: {type(node).__name__}")
+
+    def _visit_ConstDeclNode(self, node: ConstDeclNode):
+        c_type = self.map_type(node.var_type)
+        val = self._visit(node.value_expr)
+        self.symbol_types[node.name] = node.var_type
+        self.declared_symbols.add(node.name)
+        self._emit(f"static const {c_type} {node.name} = {val};")
+
+    def _visit_StructDeclNode(self, node: StructDeclNode):
+        self._emit(f"struct {node.name} {{")
+        self.indent_level += 1
+        for field in node.fields:
+            c_type = self.map_type(field.field_type)
+            self._emit(f"{c_type} {field.name};")
+        self.indent_level -= 1
+        self._emit("};")
+
+    def _visit_ClassDeclNode(self, node: ClassDeclNode):
+        self.current_class = node.name
+        for method in node.methods:
+            self._visit(method)
+            self._emit("")
+        self.current_class = None
+
+    def _visit_MethodDeclNode(self, node: MethodDeclNode):
+        self.declared_symbols.clear()
+        self.symbol_types.clear()
+
+        c_ret = self.map_type(node.return_type)
+        if self.current_class:
+            c_name = f"{self.current_class}_{node.name}"
+            if node.name == "main" and (node.is_export or node.is_static):
+                c_name = "main" if not self.kernel_mode else "kernel_main"
+        else:
+            c_name = node.name
+
         params_list = []
-        if not m.is_static:
-            params_list.append(f"{container_name}* self")
-        for p in m.params:
-            params_list.append(f"{self.c_type(p.type_name)} {p.name}")
-        return ", ".join(params_list) or "void"
+        for pname, ptype in node.params:
+            c_type = self.map_type(ptype)
+            params_list.append(f"{c_type} {pname}")
+            self.declared_symbols.add(pname)
+            self.symbol_types[pname] = ptype
 
-    def generate_header(self) -> str:
-        guard = f"SPIKE_MOD_{self.module_name.upper().replace('.', '_')}_H"
-        out = [f"#ifndef {guard}", f"#define {guard}", '#include "spike_rt.h"', "", '#ifdef __cplusplus', 'extern "C" {', '#endif', ""]
+        params_str = ", ".join(params_list) if params_list else "void"
+        export_prefix = "" if (node.is_export or c_name == "kernel_main") else "static "
 
-        for e in self.ast.enums:
-            out.append(f"typedef enum {e.name} {{")
-            for m in e.members: out.append(f"    {e.name}_{m.name} = {m.value},")
-            out.append(f"}} {e.name};\n")
+        self._emit(f"{export_prefix}{c_ret} {c_name}({params_str}) {{")
+        self.indent_level += 1
+        for stmt in node.body:
+            self._visit(stmt)
+        self.indent_level -= 1
+        self._emit("}")
 
-        for s in self.ast.structs: out.append(f"typedef struct {s.name} {s.name};")
-        for c in self.ast.classes:
-            out.append(f"typedef struct {c.name} {c.name};")
-            out.append(f"typedef struct {c.name}_VTable {c.name}_VTable;")
-        out.append("")
+    def _visit_VarDeclNode(self, node: VarDeclNode):
+        c_type = self.map_type(node.var_type)
+        val = self._visit(node.value_expr)
+        self.declared_symbols.add(node.name)
+        if node.var_type:
+            self.symbol_types[node.name] = node.var_type
+        self._emit(f"{c_type} {node.name} = {val};")
 
-        # Structs are emitted as pure data PODs
-        for s in self.ast.structs:
-            out.append(f"struct {s.name} {{")
-            for f in s.fields: out.append(f"    {self.c_type(f.type_name)} {f.name};")
-            out.append("};\n")
-
-        # Classes carry Object header and methods
-        for c in self.ast.classes:
-            out.append(f"struct {c.name}_VTable {{ Object_VTable __base; }};")
-            out.append(f"struct {c.name} {{")
-            out.append("    Object __hdr;")
-            for f in c.fields: out.append(f"    {self.c_type(f.type_name)} {f.name};")
-            out.append("};\n")
-            for m in c.methods:
-                sig = self._format_params(c.name, m)
-                out.append(f"{self.c_type(m.return_type)} {c.name}_{m.name}({sig});")
-
-        out.extend(["", "#ifdef __cplusplus", "}", "#endif", f"#endif /* {guard} */"])
-        return "\n".join(out)
-
-    def generate_source(self) -> str:
-        out = [
-            f"/* Auto-generated Pure OOP Spike Unit: {self.module_name} */",
-            '#include "spike_rt.h"',
-            f'#include "{self.module_name.replace(".", "_")}.h"',
-            ""
-        ]
-
-        for tr in self.tuple_returns:
-            t_name = self.c_type(tr)
-            types = tr[6:-1].split(",")
-            out.append(f"typedef struct {t_name} {{")
-            for idx, item_t in enumerate(types): out.append(f"    {self.c_type(item_t.strip())} _{idx};")
-            out.append(f"}} {t_name};\n")
-
-        for c in self.ast.classes:
-            out.append(f"static {c.name}_VTable __vt_{c.name} = {{ .__base = {{ NULL, NULL, NULL }} }};\n")
-
-        # Emit Class Methods
-        for c in self.ast.classes:
-            for m in c.methods:
-                if m.is_extern or not m.body: continue
-                sig = self._format_params(c.name, m)
-                out.append(f"{self.c_type(m.return_type)} {c.name}_{m.name}({sig}) {{")
-                for st in m.body: out.append(self._gen_stmt(st, "    "))
-                out.append("}\n")
-
-        # Resolve App.main or Main.main to C entry point
-        entry_call = None
-        if "App" in self.classes and any(m.name == "main" and m.is_static for m in self.classes["App"].methods):
-            entry_call = "App_main()"
-        elif "Main" in self.classes and any(m.name == "main" and m.is_static for m in self.classes["Main"].methods):
-            entry_call = "Main_main()"
-
-        if entry_call and self.module_name == "main":
-            out.append("/* Native C Entry Point connecting to Pure OOP Spike Entry */")
-            out.append("int main(int argc, char** argv) {")
-            out.append("    (void)argc; (void)argv;")
-            out.append(f"    return (int){entry_call};")
-            out.append("}\n")
-
-        return "\n".join(out)
-
-    def _gen_stmt(self, stmt: Stmt, indent: str) -> str:
-        if isinstance(stmt, VarDeclStmt):
-            self.var_types[stmt.name] = stmt.type_name
-            ct = self.c_type(stmt.type_name)
-            if stmt.type_name.startswith("array<"):
-                parts = stmt.type_name[6:-1].split(",")
-                elem_t = self.c_type(parts[0])
-                sz = parts[1]
-                return f"{indent}{elem_t} {stmt.name}[{sz}];"
-            # Class constructor instantiation
-            if stmt.type_name in self.classes and isinstance(stmt.initializer, CallExpr) and isinstance(stmt.initializer.callee, Identifier) and stmt.initializer.callee.name == stmt.type_name:
-                args = [self._gen_expr(a) for a in stmt.initializer.args]
-                return (
-                    f"{indent}{ct} {stmt.name} = ({ct})spike_alloc(sizeof({stmt.type_name}), &__vt_{stmt.type_name});\n"
-                    f"{indent}{stmt.type_name}_{stmt.type_name}({', '.join([stmt.name] + args)});"
+    def _visit_AssignStmtNode(self, node: AssignStmtNode):
+        # Enforce explicit typing on assignment to undeclared identifiers
+        if isinstance(node.target_expr, IdentifierNode):
+            name = node.target_expr.name
+            if name not in self.declared_symbols:
+                loc = f"L{node.line}:C{node.col}" if node.line > 0 else "unknown location"
+                raise SyntaxError(
+                    f"Variable '{name}' assigned before explicit type declaration at {loc}.\n"
+                    f"  Expected '{name}: <Type> = ...' instead of bare assignment."
                 )
-            # Struct value initialization
-            if stmt.type_name in self.structs and isinstance(stmt.initializer, CallExpr) and isinstance(stmt.initializer.callee, Identifier) and stmt.initializer.callee.name == stmt.type_name:
-                args = [self._gen_expr(a) for a in stmt.initializer.args]
-                return f"{indent}{ct} {stmt.name} = ({ct}){{ {', '.join(args)} }};"
 
-            init_s = f" = {self._gen_expr(stmt.initializer)}" if stmt.initializer else ""
-            return f"{indent}{ct} {stmt.name}{init_s};"
+        target = self._visit(node.target_expr)
+        val = self._visit(node.value_expr)
+        self._emit(f"{target} = {val};")
 
-        if isinstance(stmt, UnpackVarDeclStmt):
-            lines = [f"{indent}{self.c_type(stmt.initializer)} __tmp_unpack = {self._gen_expr(stmt.initializer)};"]
-            for idx, name in enumerate(stmt.names):
-                self.var_types[name] = stmt.type_names[idx]
-                lines.append(f"{indent}{self.c_type(stmt.type_names[idx])} {name} = __tmp_unpack._{idx};")
-            return "\n".join(lines)
+    def _visit_ExprStmtNode(self, node: ExprStmtNode):
+        expr_str = self._visit(node.expr)
+        self._emit(f"{expr_str};")
 
-        if isinstance(stmt, AssignStmt):
-            return f"{indent}{self._gen_expr(stmt.target)} {stmt.op} {self._gen_expr(stmt.value)};"
-        if isinstance(stmt, ReturnStmt):
-            val = f" {self._gen_expr(stmt.value)}" if stmt.value else ""
-            return f"{indent}return{val};"
-        if isinstance(stmt, BreakStmt): return f"{indent}break;"
-        if isinstance(stmt, ContinueStmt): return f"{indent}continue;"
-        if isinstance(stmt, ExprStmt): return f"{indent}{self._gen_expr(stmt.expr)};"
-        if isinstance(stmt, DisownStmt): return f"{indent}spike_disown({self._gen_expr(stmt.target)});"
-        if isinstance(stmt, OwnStmt): return f"{indent}spike_own({self._gen_expr(stmt.target)});"
-        if isinstance(stmt, RaiseStmt): return f"{indent}__spike_raise((Object*){self._gen_expr(stmt.exception)});"
+    def _visit_AsmBlockNode(self, node: AsmBlockNode):
+        if not node.instructions:
+            return
 
-        if isinstance(stmt, ForRangeStmt):
-            self.var_types[stmt.var_name] = "int"
-            lines = [f"{indent}for (int64_t {stmt.var_name} = {self._gen_expr(stmt.start)}; {stmt.var_name} < {self._gen_expr(stmt.stop)}; {stmt.var_name} += {self._gen_expr(stmt.step)}) {{"]
-            for s in stmt.body: lines.append(self._gen_stmt(s, indent + "    "))
-            lines.append(f"{indent}}}")
-            return "\n".join(lines)
+        self._emit("__asm__ __volatile__ (")
+        self.indent_level += 1
+        for inst in node.instructions:
+            self._emit(f'"{inst}\\n\\t"')
+        self.indent_level -= 1
+        self._emit(");")
 
-        if isinstance(stmt, WhileStmt):
-            lines = [f"{indent}while ({self._gen_expr(stmt.condition)}) {{"]
-            for s in stmt.body: lines.append(self._gen_stmt(s, indent + "    "))
-            lines.append(f"{indent}}}")
-            return "\n".join(lines)
+    def _visit_WhileStmtNode(self, node: WhileStmtNode):
+        cond = self._visit(node.condition)
+        self._emit(f"while ({cond}) {{")
+        self.indent_level += 1
+        for stmt in node.body:
+            self._visit(stmt)
+        self.indent_level -= 1
+        self._emit("}")
 
-        if isinstance(stmt, IfStmt):
-            lines = [f"{indent}if ({self._gen_expr(stmt.condition)}) {{"]
-            for s in stmt.then_body: lines.append(self._gen_stmt(s, indent + "    "))
-            if stmt.else_body:
-                lines.append(f"{indent}}} else {{")
-                for s in stmt.else_body: lines.append(self._gen_stmt(s, indent + "    "))
-            lines.append(f"{indent}}}")
-            return "\n".join(lines)
+    def _visit_IfStmtNode(self, node: IfStmtNode):
+        cond = self._visit(node.condition)
+        self._emit(f"if ({cond}) {{")
+        self.indent_level += 1
+        for stmt in node.then_body:
+            self._visit(stmt)
+        self.indent_level -= 1
+        self._emit("}")
 
-        if isinstance(stmt, TryStmt):
-            lines = [
-                f"{indent}{{",
-                f"{indent}    __SpikeExceptionFrame __frame;",
-                f"{indent}    __spike_push_exc_frame(&__frame);",
-                f"{indent}    if (setjmp(__frame.jmp) == 0) {{"
-            ]
-            for s in stmt.body: lines.append(self._gen_stmt(s, indent + "        "))
-            lines.append(f"{indent}        __spike_pop_exc_frame();")
-            lines.append(f"{indent}    }} else {{")
-            lines.append(f"{indent}        __spike_pop_exc_frame();")
-            lines.append(f"{indent}        Object* __exc = __frame.active_exception;")
-            for h in stmt.handlers:
-                lines.append(f"{indent}        if (__exc != NULL) {{")
-                if h.var_name: lines.append(f"{indent}            {h.exc_type}* {h.var_name} = ({h.exc_type}*)__exc;")
-                for s in h.body: lines.append(self._gen_stmt(s, indent + "            "))
-                lines.append(f"{indent}        }}")
-            lines.append(f"{indent}    }}")
-            if stmt.finally_body:
-                lines.append(f"{indent}    /* finally */")
-                for s in stmt.finally_body: lines.append(self._gen_stmt(s, indent + "    "))
-            lines.append(f"{indent}}}")
-            return "\n".join(lines)
+        if node.else_body:
+            self._emit("else {")
+            self.indent_level += 1
+            for stmt in node.else_body:
+                self._visit(stmt)
+            self.indent_level -= 1
+            self._emit("}")
 
-        if isinstance(stmt, AsmStmt):
-            outs = ", ".join(f'"{o.constraint}"({self._gen_expr(o.variable)})' for o in stmt.outputs)
-            ins = ", ".join(f'"{i.constraint}"({self._gen_expr(i.variable)})' for i in stmt.inputs)
-            clobs = ", ".join(f'"{c}"' for c in stmt.clobbers)
-            return f'{indent}__asm__ __volatile__("{stmt.template}" : {outs} : {ins} : {clobs});'
+    def _visit_ReturnStmtNode(self, node: ReturnStmtNode):
+        if node.value_expr:
+            val = self._visit(node.value_expr)
+            self._emit(f"return {val};")
+        else:
+            self._emit("return;")
 
-        raise NotImplementedError(f"Statement {type(stmt)} not implemented")
+    # Expression Visitors
+    def _visit_BinaryOpNode(self, node: BinaryOpNode) -> str:
+        left = self._visit(node.left)
+        right = self._visit(node.right)
+        return f"({left} {node.op} {right})"
 
-    def _gen_expr(self, expr: Expr) -> str:
-        if isinstance(expr, IntLiteral): return str(expr.value)
-        if isinstance(expr, FloatLiteral): return str(expr.value)
-        if isinstance(expr, StringLiteral): return f'spike_string_new("{expr.value}")'
-        if isinstance(expr, BoolLiteral): return "true" if expr.value else "false"
-        if isinstance(expr, Identifier): return expr.name
-        if isinstance(expr, UnaryExpr): return f"({expr.op}{self._gen_expr(expr.right)})"
-        if isinstance(expr, BinaryExpr): return f"({self._gen_expr(expr.left)} {expr.op} {self._gen_expr(expr.right)})"
-        if isinstance(expr, CastExpr): return f"(({self.c_type(expr.to_type)})({self._gen_expr(expr.target)}))"
-        if isinstance(expr, SizeofExpr): return f"sizeof({self.c_type(expr.type_name)})"
-        if isinstance(expr, LenExpr):
-            tgt = self._gen_expr(expr.target)
-            return f"(((Object*){tgt})->__vtable == (void*)0 ? ((Slice*){tgt})->length : ((String*){tgt})->length)"
-        if isinstance(expr, TypeCheckExpr):
-            return f"(((Object*){self._gen_expr(expr.target)})->__type_id == 0)"
-        if isinstance(expr, MemberAccessExpr):
-            tgt = self._gen_expr(expr.target)
-            return f"{tgt}.{expr.member}" if self.var_types.get(tgt) in self.structs else f"{tgt}->{expr.member}"
-        if isinstance(expr, IndexAccessExpr):
-            tgt = self._gen_expr(expr.target)
-            idx = self._gen_expr(expr.index)
-            return f"(*({self.c_type(self.var_types.get(tgt, 'int'))}*)__spike_bounds_check({tgt}, {idx}, sizeof({tgt})/sizeof({tgt}[0]), sizeof({tgt}[0])))"
-        if isinstance(expr, SliceExpr):
-            tgt = self._gen_expr(expr.target)
-            st = self._gen_expr(expr.start)
-            en = self._gen_expr(expr.end)
-            return f"__spike_slice_create({tgt}, {st}, {en}, sizeof({tgt})/sizeof({tgt}[0]), sizeof({tgt}[0]))"
-        if isinstance(expr, TupleLiteral):
-            args = [f"._{idx} = {self._gen_expr(e)}" for idx, e in enumerate(expr.elements)]
-            return f"{{ {', '.join(args)} }}"
-        if isinstance(expr, CallExpr):
-            # Static Method Call Resolution: ClassName.static_method(...)
-            if isinstance(expr.callee, MemberAccessExpr) and isinstance(expr.callee.target, Identifier):
-                container = expr.callee.target.name
-                method_name = expr.callee.member
-                if container in self.classes:
-                    args = [self._gen_expr(a) for a in expr.args]
-                    return f"{container}_{method_name}({', '.join(args)})"
+    def _visit_UnaryOpNode(self, node: UnaryOpNode) -> str:
+        operand = self._visit(node.operand)
+        return f"({node.op}{operand})"
 
-            # Instance Method Call Resolution: instance.method(...)
-            if isinstance(expr.callee, MemberAccessExpr):
-                obj_str = self._gen_expr(expr.callee.target)
-                method_name = expr.callee.member
-                args = [obj_str] + [self._gen_expr(a) for a in expr.args]
-                obj_type = self.var_types.get(obj_str, "Object")
-                return f"{obj_type}_{method_name}({', '.join(args)})"
+    def _visit_CastExprNode(self, node: CastExprNode) -> str:
+        target_c_type = self.map_type(node.target_type)
+        expr_str = self._visit(node.expr)
+        return f"(({target_c_type})({expr_str}))"
 
-            # Struct Value Instantiation: Point(10, 20) -> (Point){ .x = 10, .y = 20 }
-            if isinstance(expr.callee, Identifier) and expr.callee.name in self.structs:
-                st_name = expr.callee.name
-                args = [self._gen_expr(a) for a in expr.args]
-                return f"(({st_name}){{ {', '.join(args)} }})"
+    def _visit_MemberAccessNode(self, node: MemberAccessNode) -> str:
+        if isinstance(node.target, IdentifierNode):
+            t_name = node.target.name
+            if t_name in self.class_types:
+                return f"{t_name}_{node.member}"
+            var_type = self.symbol_types.get(t_name)
+            if var_type and var_type in self.class_types:
+                return f"{var_type}_{node.member}"
 
-            callee_name = self._gen_expr(expr.callee)
-            args = [self._gen_expr(a) for a in expr.args]
-            return f"{callee_name}({', '.join(args)})"
+        target_str = self._visit(node.target)
+        if self.is_pointer_type(node.target):
+            return f"{target_str}->{node.member}"
 
-        raise NotImplementedError(f"Expression {type(expr)} not implemented")
+        return f"{target_str}.{node.member}"
+
+    def _visit_CallExprNode(self, node: CallExprNode) -> str:
+        args_str = ", ".join(self._visit(a) for a in node.args)
+
+        # Struct Constructor: StructName(...) -> (struct StructName){ ... }
+        if isinstance(node.callee, IdentifierNode):
+            c_name = node.callee.name
+            if c_name in self.struct_types:
+                return f"(struct {c_name}){{ {args_str} }}"
+            if c_name in self.class_types:
+                return f"(struct {c_name}){{ 0 }}"
+
+        # Method Call: target.method(...)
+        if isinstance(node.callee, MemberAccessNode):
+            member = node.callee.member
+            if isinstance(node.callee.target, IdentifierNode):
+                tgt_name = node.callee.target.name
+                if tgt_name in self.class_types:
+                    return f"{tgt_name}_{member}({args_str})"
+                var_type = self.symbol_types.get(tgt_name)
+                if var_type in self.class_types:
+                    return f"{var_type}_{member}({args_str})"
+
+        callee_str = self._visit(node.callee)
+        return f"{callee_str}({args_str})"
+
+    def _visit_IdentifierNode(self, node: IdentifierNode) -> str:
+        return node.name
+
+    def _visit_LiteralNode(self, node: LiteralNode) -> str:
+        if node.raw_type == "string":
+            return f'"{node.value}"'
+        elif node.raw_type == "bool":
+            return "true" if node.value else "false"
+        elif isinstance(node.value, int):
+            return hex(node.value) if node.value > 9 else str(node.value)
+        return str(node.value)
+
+
+# ============================================================================
+# 5. Compiler Interface
+# ============================================================================
+
+class Compiler:
+    def __init__(self, kernel_mode: bool = False):
+        self.kernel_mode = kernel_mode
+
+    def compile(self, source_code: str) -> str:
+        lexer = Lexer(source_code)
+        tokens = lexer.tokenize()
+
+        parser = Parser(tokens)
+        ast_root = parser.parse()
+
+        generator = CCodeGenerator(kernel_mode=self.kernel_mode)
+        c_code = generator.generate(ast_root)
+
+        return c_code

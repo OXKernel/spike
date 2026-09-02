@@ -73,3 +73,63 @@ qemu-system-x86_64 -kernel kernel.elf
 ### Bare metal binary (.bin)
 python3 spike_driver.py kernel.spike --mode kernel --format bin -o kernel.bin
 
+## 4. C. Integration
+
+# 4.1 Declare external C functions and global variables
+extern def memset(dest: *u8, val: u8, count: u64): *u8
+extern def fs_mount(disk_id: u32, mount_point: *u8): i32
+extern def uart_putc(c: u8): none
+
+class Kernel {
+    def init() {
+        # Call the existing C function naturally
+        buffer: *u8 = 0x100000 as *u8
+        memset(buffer, 0, 4096)
+
+        status: i32 = fs_mount(0, "/mnt" as *u8)
+    }
+}
+
+# This generates:
+/* Forward declarations from Spike 'extern' */
+extern uint8_t* memset(uint8_t* dest, uint8_t val, uint64_t count);
+extern int32_t fs_mount(uint32_t disk_id, uint8_t* mount_point);
+extern void uart_putc(uint8_t c);
+
+void Kernel_init(void) {
+    uint8_t* buffer = ((uint8_t*)(0x100000));
+    memset(buffer, 0, 4096);
+    int32_t status = fs_mount(0, ((uint8_t*)("/mnt")));
+}
+
+# 4.2 Top-level: include existing C headers
+c_decl {
+    '#include "fat_fs.h"'
+    '#include "rtl8139.h"'
+}
+
+class Storage {
+    def read_block(lba: u32) {
+        # Inline C block executing arbitrary C logic
+        c_inline {
+            "fat_read_sector(lba);"
+        }
+    }
+}
+
+# 4.3.1 Compile your existing legacy C code with GCC / Clang
+gcc -m64 -ffreestanding -c legacy_fat_fs.c -o build/legacy_fat_fs.o
+
+# 4.3.2. Compile your Spike source to an object file
+python3 spike_driver.py kernel.spike -k -c -o build/kernel_spike.o
+
+# 4.3.3. Link them together
+ld -m elf_i386 -nostdlib -T linker.ld \
+   build/boot64.o build/legacy_fat_fs.o build/kernel_spike.o \
+   -o build/kernel.elf
+
+Use extern def when calling existing C libraries, drivers, or standard libc functions 
+(memset, memcpy, filesystem routines). It keeps the Spike codebase clean, strongly typed, and readable.
+
+Use c_decl / c_inline when you need #include directives for complex C macro definitions or small glue snippets.
+

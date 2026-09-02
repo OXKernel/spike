@@ -1,7 +1,8 @@
 """
 compiler.py - Spike Language Compiler & C Transpiler
 Supports user-space and freestanding kernel-mode compilation targets.
-Provides precise line and column diagnostics on syntax & semantic errors.
+Supports calling external C functions via 'extern def', top-level 'c_decl', 
+and scoped 'c_inline' blocks.
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ class TokenType:
     DEF = "DEF"
     STATIC = "STATIC"
     EXPORT = "EXPORT"
+    EXTERN = "EXTERN"
     ASM = "ASM"
+    C_INLINE = "C_INLINE"
+    C_DECL = "C_DECL"
     AS = "AS"
     WHILE = "WHILE"
     IF = "IF"
@@ -73,7 +77,10 @@ KEYWORDS = {
     "def": TokenType.DEF,
     "static": TokenType.STATIC,
     "export": TokenType.EXPORT,
+    "extern": TokenType.EXTERN,
     "asm": TokenType.ASM,
+    "c_inline": TokenType.C_INLINE,
+    "c_decl": TokenType.C_DECL,
     "as": TokenType.AS,
     "while": TokenType.WHILE,
     "if": TokenType.IF,
@@ -127,12 +134,12 @@ class Lexer:
         while self.pos < self.length:
             char = self._peek()
 
-            # Skip Whitespace
+            # Whitespace
             if char in (" ", "\t", "\r", "\n"):
                 self._advance()
                 continue
 
-            # Python-style single-line comments (#)
+            # Single-line Python comments (#)
             if char == "#":
                 while self._peek() and self._peek() != "\n":
                     self._advance()
@@ -224,7 +231,6 @@ class Lexer:
                 tokens.append(Token(TokenType.GE, ">=", start_line, start_col))
                 continue
 
-            # Single-character Delimiters & Operators
             single_char_tokens = {
                 "{": TokenType.LBRACE,
                 "}": TokenType.RBRACE,
@@ -260,7 +266,7 @@ class Lexer:
 
 
 # ============================================================================
-# 2. Abstract Syntax Tree (AST) Nodes (With Line & Col Metadata)
+# 2. Abstract Syntax Tree (AST) Nodes
 # ============================================================================
 
 class ASTNode:
@@ -272,6 +278,23 @@ class ProgramNode(ASTNode):
     def __init__(self, declarations: List[ASTNode], line: int = 0, col: int = 0):
         super().__init__(line, col)
         self.declarations = declarations
+
+class ExternDefNode(ASTNode):
+    def __init__(self, name: str, params: List[tuple[str, str]], return_type: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+        self.params = params
+        self.return_type = return_type
+
+class CDeclBlockNode(ASTNode):
+    def __init__(self, raw_lines: List[str], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.raw_lines = raw_lines
+
+class CInlineBlockNode(ASTNode):
+    def __init__(self, raw_lines: List[str], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.raw_lines = raw_lines
 
 class ConstDeclNode(ASTNode):
     def __init__(self, name: str, var_type: str, value_expr: ASTNode, line: int = 0, col: int = 0):
@@ -435,7 +458,11 @@ class Parser:
         return ProgramNode(declarations, line=start_tok.line, col=start_tok.col)
 
     def _parse_top_level_declaration(self) -> ASTNode:
-        if self._check(TokenType.CONST):
+        if self._check(TokenType.EXTERN):
+            return self._parse_extern_declaration()
+        elif self._check(TokenType.C_DECL):
+            return self._parse_c_decl_block()
+        elif self._check(TokenType.CONST):
             return self._parse_const_declaration()
         elif self._check(TokenType.STRUCT):
             return self._parse_struct_declaration()
@@ -444,6 +471,57 @@ class Parser:
         else:
             tok = self._peek()
             raise SyntaxError(f"Unexpected top-level token: {tok.type} ('{tok.value}') at L{tok.line}:C{tok.col}")
+
+    def _parse_extern_declaration(self) -> ExternDefNode:
+        start_tok = self._consume(TokenType.EXTERN)
+        self._consume(TokenType.DEF)
+        name_tok = self._consume(TokenType.IDENTIFIER)
+        self._consume(TokenType.LPAREN)
+
+        params: List[tuple[str, str]] = []
+        if not self._check(TokenType.RPAREN):
+            while True:
+                pname = self._consume(TokenType.IDENTIFIER).value
+                self._consume(TokenType.COLON)
+                ptype = self._parse_type()
+                params.append((pname, ptype))
+                if not self._match(TokenType.COMMA):
+                    break
+
+        self._consume(TokenType.RPAREN)
+
+        return_type = "none"
+        if self._match(TokenType.COLON) or self._match(TokenType.ARROW):
+            return_type = self._parse_type()
+
+        self._match(TokenType.SEMICOLON)
+        return ExternDefNode(name_tok.value, params, return_type, line=start_tok.line, col=start_tok.col)
+
+    def _parse_c_decl_block(self) -> CDeclBlockNode:
+        start_tok = self._consume(TokenType.C_DECL)
+        self._consume(TokenType.LBRACE)
+        lines: List[str] = []
+
+        while not self._check(TokenType.RBRACE) and not self._check(TokenType.EOF):
+            token = self._consume(TokenType.STRING_LITERAL)
+            lines.append(str(token.value))
+            self._match(TokenType.SEMICOLON)
+
+        self._consume(TokenType.RBRACE)
+        return CDeclBlockNode(lines, line=start_tok.line, col=start_tok.col)
+
+    def _parse_c_inline_block(self) -> CInlineBlockNode:
+        start_tok = self._consume(TokenType.C_INLINE)
+        self._consume(TokenType.LBRACE)
+        lines: List[str] = []
+
+        while not self._check(TokenType.RBRACE) and not self._check(TokenType.EOF):
+            token = self._consume(TokenType.STRING_LITERAL)
+            lines.append(str(token.value))
+            self._match(TokenType.SEMICOLON)
+
+        self._consume(TokenType.RBRACE)
+        return CInlineBlockNode(lines, line=start_tok.line, col=start_tok.col)
 
     def _parse_const_declaration(self) -> ConstDeclNode:
         start_tok = self._consume(TokenType.CONST)
@@ -529,6 +607,8 @@ class Parser:
     def _parse_statement(self) -> ASTNode:
         if self._check(TokenType.ASM):
             return self._parse_asm_statement()
+        elif self._check(TokenType.C_INLINE):
+            return self._parse_c_inline_block()
         elif self._check(TokenType.WHILE):
             return self._parse_while_statement()
         elif self._check(TokenType.IF):
@@ -546,7 +626,7 @@ class Parser:
             self._match(TokenType.SEMICOLON)
             return VarDeclNode(name_tok.value, var_type, val, line=name_tok.line, col=name_tok.col)
 
-        # Assignment statement (target = expr)
+        # Assignment / Expression Statement
         else:
             expr = self._parse_expression()
             if self._match(TokenType.EQUALS):
@@ -701,7 +781,7 @@ class Parser:
 
 
 # ============================================================================
-# 4. C Code Generator (With Error Diagnostics & Pointer Dereferencing)
+# 4. C Code Generator
 # ============================================================================
 
 class CCodeGenerator:
@@ -727,8 +807,9 @@ class CCodeGenerator:
         self.current_class: Optional[str] = None
         self.struct_types: Set[str] = set()
         self.class_types: Set[str] = set()
+        self.extern_functions: Set[str] = set()
         
-        # Symbol Table & Scoped Type System
+        # Scoped Symbol Tracking
         self.declared_symbols: Set[str] = set()
         self.symbol_types: Dict[str, str] = {}
 
@@ -755,10 +836,7 @@ class CCodeGenerator:
         if spike_type in self.TYPE_MAP:
             return self.TYPE_MAP[spike_type]
 
-        if spike_type in self.struct_types:
-            return f"struct {spike_type}"
-
-        if spike_type in self.class_types:
+        if spike_type in self.struct_types or spike_type in self.class_types:
             return f"struct {spike_type}"
 
         return spike_type
@@ -794,7 +872,7 @@ class CCodeGenerator:
     def generate(self, root: ProgramNode) -> str:
         self.output.clear()
 
-        # 1. Header
+        # 1. Standard Header Directives
         if self.kernel_mode:
             self._emit("/* Generated by Spike Compiler - Standalone Kernel Mode */")
             self._emit("#include <stdint.h>")
@@ -808,14 +886,23 @@ class CCodeGenerator:
             self._emit("#include <stdbool.h>")
             self._emit("")
 
-        # 2. Collect Struct & Class Names
+        # 2. Emit Top-Level c_decl Blocks (Verbatim C code, includes, macros)
+        for decl in root.declarations:
+            if isinstance(decl, CDeclBlockNode):
+                for line in decl.raw_lines:
+                    self._emit(line)
+                self._emit("")
+
+        # 3. Collect Structs, Classes & Extern Functions
         for decl in root.declarations:
             if isinstance(decl, StructDeclNode):
                 self.struct_types.add(decl.name)
             elif isinstance(decl, ClassDeclNode):
                 self.class_types.add(decl.name)
+            elif isinstance(decl, ExternDefNode):
+                self.extern_functions.add(decl.name)
 
-        # 3. Forward Struct & Class Declarations
+        # 4. Forward Struct & Class Declarations
         for decl in root.declarations:
             if isinstance(decl, StructDeclNode):
                 self._emit(f"struct {decl.name};")
@@ -824,10 +911,18 @@ class CCodeGenerator:
         if self.struct_types or self.class_types:
             self._emit("")
 
-        # 4. Generate Code
+        # 5. Emit 'extern def' Prototypes
         for decl in root.declarations:
-            self._visit(decl)
+            if isinstance(decl, ExternDefNode):
+                self._visit(decl)
+        if self.extern_functions:
             self._emit("")
+
+        # 6. Generate All Other Top-Level Declarations
+        for decl in root.declarations:
+            if not isinstance(decl, (CDeclBlockNode, ExternDefNode)):
+                self._visit(decl)
+                self._emit("")
 
         return "\n".join(self.output)
 
@@ -838,6 +933,15 @@ class CCodeGenerator:
 
     def _generic_visit(self, node: ASTNode):
         raise NotImplementedError(f"No visitor defined for AST node: {type(node).__name__}")
+
+    def _visit_ExternDefNode(self, node: ExternDefNode):
+        c_ret = self.map_type(node.return_type)
+        params_list = []
+        for pname, ptype in node.params:
+            c_type = self.map_type(ptype)
+            params_list.append(f"{c_type} {pname}")
+        params_str = ", ".join(params_list) if params_list else "void"
+        self._emit(f"extern {c_ret} {node.name}({params_str});")
 
     def _visit_ConstDeclNode(self, node: ConstDeclNode):
         c_type = self.map_type(node.var_type)
@@ -900,7 +1004,7 @@ class CCodeGenerator:
         self._emit(f"{c_type} {node.name} = {val};")
 
     def _visit_AssignStmtNode(self, node: AssignStmtNode):
-        # Enforce explicit typing on assignment to undeclared identifiers
+        # Strict enforcement: target identifier must be explicitly typed earlier
         if isinstance(node.target_expr, IdentifierNode):
             name = node.target_expr.name
             if name not in self.declared_symbols:
@@ -917,6 +1021,10 @@ class CCodeGenerator:
     def _visit_ExprStmtNode(self, node: ExprStmtNode):
         expr_str = self._visit(node.expr)
         self._emit(f"{expr_str};")
+
+    def _visit_CInlineBlockNode(self, node: CInlineBlockNode):
+        for line in node.raw_lines:
+            self._emit(line)
 
     def _visit_AsmBlockNode(self, node: AsmBlockNode):
         if not node.instructions:
@@ -995,7 +1103,11 @@ class CCodeGenerator:
     def _visit_CallExprNode(self, node: CallExprNode) -> str:
         args_str = ", ".join(self._visit(a) for a in node.args)
 
-        # Struct Constructor: StructName(...) -> (struct StructName){ ... }
+        # 1. External C function call or global function
+        if isinstance(node.callee, IdentifierNode) and node.callee.name in self.extern_functions:
+            return f"{node.callee.name}({args_str})"
+
+        # 2. Struct Constructor: StructName(...) -> (struct StructName){ ... }
         if isinstance(node.callee, IdentifierNode):
             c_name = node.callee.name
             if c_name in self.struct_types:
@@ -1003,7 +1115,7 @@ class CCodeGenerator:
             if c_name in self.class_types:
                 return f"(struct {c_name}){{ 0 }}"
 
-        # Method Call: target.method(...)
+        # 3. Class Method: ClassName.method(...) or instance.method(...)
         if isinstance(node.callee, MemberAccessNode):
             member = node.callee.member
             if isinstance(node.callee.target, IdentifierNode):

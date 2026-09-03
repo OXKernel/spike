@@ -129,6 +129,8 @@ def compile_spike(
             # KERNEL MODE PIPELINE (Freestanding, No Runtime)
             # -------------------------------------------------------------
             kernel_flags = [
+                "-I",
+                ".",
                 "-ffreestanding",
                 "-m64",
                 "-nostdlib",

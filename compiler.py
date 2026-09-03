@@ -1,8 +1,8 @@
 """
 compiler.py - Spike Language Compiler & C Transpiler
 Supports user-space and freestanding kernel-mode compilation targets.
-Supports calling external C functions via 'extern def', top-level 'c_decl', 
-and scoped 'c_inline' blocks.
+Resolves bare class-method calls inside classes to their namespaced symbols,
+preventing undefined reference errors at link time.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Set, Union
 # ============================================================================
 
 class TokenType:
-    # Keywords
     CONST = "CONST"
     STRUCT = "STRUCT"
     CLASS = "CLASS"
@@ -31,41 +30,60 @@ class TokenType:
     IF = "IF"
     ELSE = "ELSE"
     RETURN = "RETURN"
+    SIZEOF = "SIZEOF"
     TRUE = "TRUE"
     FALSE = "FALSE"
 
-    # Identifiers and Literals
     IDENTIFIER = "IDENTIFIER"
     INT_LITERAL = "INT_LITERAL"
     HEX_LITERAL = "HEX_LITERAL"
     STRING_LITERAL = "STRING_LITERAL"
 
-    # Symbols and Operators
-    LBRACE = "LBRACE"          # {
-    RBRACE = "RBRACE"          # }
-    LPAREN = "LPAREN"          # (
-    RPAREN = "RPAREN"          # )
-    COLON = "COLON"            # :
-    SEMICOLON = "SEMICOLON"    # ;
-    COMMA = "COMMA"            # ,
-    DOT = "DOT"                # .
-    ARROW = "ARROW"            # ->
-    EQUALS = "EQUALS"          # =
-    PLUS = "PLUS"              # +
-    MINUS = "MINUS"            # -
-    STAR = "STAR"              # *
-    SLASH = "SLASH"            # /
-    PERCENT = "PERCENT"        # %
-    AMP = "AMP"                # &
-    PIPE = "PIPE"              # |
-    CARET = "CARET"            # ^
-    BANG = "BANG"              # !
-    LT = "LT"                  # <
-    GT = "GT"                  # >
-    LE = "LE"                  # <=
-    GE = "GE"                  # >=
-    EQ = "EQ"                  # ==
-    NE = "NE"                  # !=
+    LBRACE = "LBRACE"
+    RBRACE = "RBRACE"
+    LPAREN = "LPAREN"
+    RPAREN = "RPAREN"
+    COLON = "COLON"
+    SEMICOLON = "SEMICOLON"
+    COMMA = "COMMA"
+    DOT = "DOT"
+    ARROW = "ARROW"
+    TILDE = "TILDE"
+    ELLIPSIS = "ELLIPSIS"
+
+    EQUALS = "EQUALS"
+    PLUS_EQ = "PLUS_EQ"
+    MINUS_EQ = "MINUS_EQ"
+    STAR_EQ = "STAR_EQ"
+    SLASH_EQ = "SLASH_EQ"
+    PERCENT_EQ = "PERCENT_EQ"
+    AMP_EQ = "AMP_EQ"
+    PIPE_EQ = "PIPE_EQ"
+    CARET_EQ = "CARET_EQ"
+    SHL_EQ = "SHL_EQ"
+    SHR_EQ = "SHR_EQ"
+
+    LOGICAL_AND = "LOGICAL_AND"
+    LOGICAL_OR = "LOGICAL_OR"
+
+    PLUS = "PLUS"
+    MINUS = "MINUS"
+    STAR = "STAR"
+    SLASH = "SLASH"
+    PERCENT = "PERCENT"
+    AMP = "AMP"
+    PIPE = "PIPE"
+    CARET = "CARET"
+    BANG = "BANG"
+    SHL = "SHL"
+    SHR = "SHR"
+
+    LT = "LT"
+    GT = "GT"
+    LE = "LE"
+    GE = "GE"
+    EQ = "EQ"
+    NE = "NE"
 
     EOF = "EOF"
 
@@ -86,6 +104,7 @@ KEYWORDS = {
     "if": TokenType.IF,
     "else": TokenType.ELSE,
     "return": TokenType.RETURN,
+    "sizeof": TokenType.SIZEOF,
     "True": TokenType.TRUE,
     "False": TokenType.FALSE,
 }
@@ -134,18 +153,15 @@ class Lexer:
         while self.pos < self.length:
             char = self._peek()
 
-            # Whitespace
             if char in (" ", "\t", "\r", "\n"):
                 self._advance()
                 continue
 
-            # Single-line Python comments (#)
             if char == "#":
                 while self._peek() and self._peek() != "\n":
                     self._advance()
                 continue
 
-            # C-style comments (// and /* */)
             if char == "/" and self._peek(1) == "/":
                 while self._peek() and self._peek() != "\n":
                     self._advance()
@@ -162,7 +178,6 @@ class Lexer:
 
             start_line, start_col = self.line, self.col
 
-            # Hex numbers (0x...)
             if char == "0" and self._peek(1) in ("x", "X"):
                 self._advance()
                 self._advance()
@@ -172,7 +187,6 @@ class Lexer:
                 tokens.append(Token(TokenType.HEX_LITERAL, int(num_str, 16), start_line, start_col))
                 continue
 
-            # Decimal numbers
             if char.isdigit():
                 num_str = ""
                 while self._peek().isdigit():
@@ -180,7 +194,6 @@ class Lexer:
                 tokens.append(Token(TokenType.INT_LITERAL, int(num_str), start_line, start_col))
                 continue
 
-            # Identifiers and Keywords
             if char.isalpha() or char == "_":
                 ident = ""
                 while self._peek().isalnum() or self._peek() == "_":
@@ -189,7 +202,6 @@ class Lexer:
                 tokens.append(Token(token_type, ident, start_line, start_col))
                 continue
 
-            # String literals
             if char in ('"', "'"):
                 quote_type = self._advance()
                 str_val = ""
@@ -204,7 +216,87 @@ class Lexer:
                 tokens.append(Token(TokenType.STRING_LITERAL, str_val, start_line, start_col))
                 continue
 
-            # Multi-character Operators
+            if char == "." and self._peek(1) == "." and self._peek(2) == ".":
+                self._advance()
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.ELLIPSIS, "...", start_line, start_col))
+                continue
+            if char == "<" and self._peek(1) == "<" and self._peek(2) == "=":
+                self._advance()
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.SHL_EQ, "<<=", start_line, start_col))
+                continue
+            if char == ">" and self._peek(1) == ">" and self._peek(2) == "=":
+                self._advance()
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.SHR_EQ, ">>=", start_line, start_col))
+                continue
+
+            if char == "<" and self._peek(1) == "<":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.SHL, "<<", start_line, start_col))
+                continue
+            if char == ">" and self._peek(1) == ">":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.SHR, ">>", start_line, start_col))
+                continue
+            if char == "&" and self._peek(1) == "&":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.LOGICAL_AND, "&&", start_line, start_col))
+                continue
+            if char == "|" and self._peek(1) == "|":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.LOGICAL_OR, "||", start_line, start_col))
+                continue
+
+            if char == "+" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.PLUS_EQ, "+=", start_line, start_col))
+                continue
+            if char == "-" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.MINUS_EQ, "-=", start_line, start_col))
+                continue
+            if char == "*" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.STAR_EQ, "*=", start_line, start_col))
+                continue
+            if char == "/" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.SLASH_EQ, "/=", start_line, start_col))
+                continue
+            if char == "%" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.PERCENT_EQ, "%=", start_line, start_col))
+                continue
+            if char == "&" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.AMP_EQ, "&=", start_line, start_col))
+                continue
+            if char == "|" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.PIPE_EQ, "|=", start_line, start_col))
+                continue
+            if char == "^" and self._peek(1) == "=":
+                self._advance()
+                self._advance()
+                tokens.append(Token(TokenType.CARET_EQ, "^=", start_line, start_col))
+                continue
+
             if char == "-" and self._peek(1) == ">":
                 self._advance()
                 self._advance()
@@ -249,6 +341,7 @@ class Lexer:
                 "&": TokenType.AMP,
                 "|": TokenType.PIPE,
                 "^": TokenType.CARET,
+                "~": TokenType.TILDE,
                 "!": TokenType.BANG,
                 "<": TokenType.LT,
                 ">": TokenType.GT,
@@ -280,11 +373,12 @@ class ProgramNode(ASTNode):
         self.declarations = declarations
 
 class ExternDefNode(ASTNode):
-    def __init__(self, name: str, params: List[tuple[str, str]], return_type: str, line: int = 0, col: int = 0):
+    def __init__(self, name: str, params: List[tuple[str, str]], return_type: str, is_variadic: bool = False, line: int = 0, col: int = 0):
         super().__init__(line, col)
         self.name = name
         self.params = params
         self.return_type = return_type
+        self.is_variadic = is_variadic
 
 class CDeclBlockNode(ASTNode):
     def __init__(self, raw_lines: List[str], line: int = 0, col: int = 0):
@@ -341,9 +435,10 @@ class VarDeclNode(ASTNode):
         self.value_expr = value_expr
 
 class AssignStmtNode(ASTNode):
-    def __init__(self, target_expr: ASTNode, value_expr: ASTNode, line: int = 0, col: int = 0):
+    def __init__(self, target_expr: ASTNode, op: str, value_expr: ASTNode, line: int = 0, col: int = 0):
         super().__init__(line, col)
         self.target_expr = target_expr
+        self.op = op
         self.value_expr = value_expr
 
 class AsmBlockNode(ASTNode):
@@ -375,6 +470,11 @@ class ExprStmtNode(ASTNode):
         super().__init__(line, col)
         self.expr = expr
 
+class SizeofExprNode(ASTNode):
+    def __init__(self, target_type_or_expr: Union[str, ASTNode], line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.target = target_type_or_expr
+
 class BinaryOpNode(ASTNode):
     def __init__(self, left: ASTNode, op: str, right: ASTNode, line: int = 0, col: int = 0):
         super().__init__(line, col)
@@ -395,9 +495,10 @@ class CastExprNode(ASTNode):
         self.target_type = target_type
 
 class MemberAccessNode(ASTNode):
-    def __init__(self, target: ASTNode, member: str, line: int = 0, col: int = 0):
+    def __init__(self, target: ASTNode, op: str, member: str, line: int = 0, col: int = 0):
         super().__init__(line, col)
         self.target = target
+        self.op = op
         self.member = member
 
 class CallExprNode(ASTNode):
@@ -421,6 +522,20 @@ class LiteralNode(ASTNode):
 # ============================================================================
 # 3. Recursive Descent Parser
 # ============================================================================
+
+ASSIGNMENT_OPS = {
+    TokenType.EQUALS: "=",
+    TokenType.PLUS_EQ: "+=",
+    TokenType.MINUS_EQ: "-=",
+    TokenType.STAR_EQ: "*=",
+    TokenType.SLASH_EQ: "/=",
+    TokenType.PERCENT_EQ: "%=",
+    TokenType.AMP_EQ: "&=",
+    TokenType.PIPE_EQ: "|=",
+    TokenType.CARET_EQ: "^=",
+    TokenType.SHL_EQ: "<<=",
+    TokenType.SHR_EQ: ">>=",
+}
 
 class Parser:
     def __init__(self, tokens: List[Token]):
@@ -479,8 +594,13 @@ class Parser:
         self._consume(TokenType.LPAREN)
 
         params: List[tuple[str, str]] = []
+        is_variadic = False
+
         if not self._check(TokenType.RPAREN):
             while True:
+                if self._match(TokenType.ELLIPSIS):
+                    is_variadic = True
+                    break
                 pname = self._consume(TokenType.IDENTIFIER).value
                 self._consume(TokenType.COLON)
                 ptype = self._parse_type()
@@ -495,7 +615,7 @@ class Parser:
             return_type = self._parse_type()
 
         self._match(TokenType.SEMICOLON)
-        return ExternDefNode(name_tok.value, params, return_type, line=start_tok.line, col=start_tok.col)
+        return ExternDefNode(name_tok.value, params, return_type, is_variadic=is_variadic, line=start_tok.line, col=start_tok.col)
 
     def _parse_c_decl_block(self) -> CDeclBlockNode:
         start_tok = self._consume(TokenType.C_DECL)
@@ -548,6 +668,7 @@ class Parser:
             fields.append(StructFieldNode(fname_tok.value, ftype, line=fname_tok.line, col=fname_tok.col))
 
         self._consume(TokenType.RBRACE)
+        self._match(TokenType.SEMICOLON)
         return StructDeclNode(name_tok.value, fields, line=start_tok.line, col=start_tok.col)
 
     def _parse_class_declaration(self) -> ClassDeclNode:
@@ -565,6 +686,7 @@ class Parser:
             methods.append(self._parse_method_declaration(is_static, is_export))
 
         self._consume(TokenType.RBRACE)
+        self._match(TokenType.SEMICOLON)
         return ClassDeclNode(name_tok.value, methods, line=start_tok.line, col=start_tok.col)
 
     def _parse_method_declaration(self, is_static: bool, is_export: bool) -> MethodDeclNode:
@@ -615,8 +737,7 @@ class Parser:
             return self._parse_if_statement()
         elif self._check(TokenType.RETURN):
             return self._parse_return_statement()
-        
-        # Explicit Type Declaration: `name: Type = expr;`
+
         elif self._check(TokenType.IDENTIFIER) and self._peek(1).type == TokenType.COLON:
             name_tok = self._consume(TokenType.IDENTIFIER)
             self._consume(TokenType.COLON)
@@ -626,13 +747,15 @@ class Parser:
             self._match(TokenType.SEMICOLON)
             return VarDeclNode(name_tok.value, var_type, val, line=name_tok.line, col=name_tok.col)
 
-        # Assignment / Expression Statement
         else:
             expr = self._parse_expression()
-            if self._match(TokenType.EQUALS):
+            if self._peek().type in ASSIGNMENT_OPS:
+                op_token = self._peek()
+                op_str = ASSIGNMENT_OPS[op_token.type]
+                self._advance_token()
                 val = self._parse_expression()
                 self._match(TokenType.SEMICOLON)
-                return AssignStmtNode(expr, val, line=expr.line, col=expr.col)
+                return AssignStmtNode(expr, op_str, val, line=expr.line, col=expr.col)
             self._match(TokenType.SEMICOLON)
             return ExprStmtNode(expr, line=expr.line, col=expr.col)
 
@@ -700,19 +823,74 @@ class Parser:
         self.pos += 1
         return tok
 
+    # ========================================================================
+    # Precedence-Climbing Expression Hierarchy
+    # ========================================================================
+
     def _parse_expression(self) -> ASTNode:
         return self._parse_cast_expression()
 
     def _parse_cast_expression(self) -> ASTNode:
-        expr = self._parse_comparison()
+        expr = self._parse_logical_or()
         while self._match(TokenType.AS):
             target_type = self._parse_type()
             expr = CastExprNode(expr, target_type, line=expr.line, col=expr.col)
         return expr
 
-    def _parse_comparison(self) -> ASTNode:
+    def _parse_logical_or(self) -> ASTNode:
+        expr = self._parse_logical_and()
+        while self._match(TokenType.LOGICAL_OR):
+            right = self._parse_logical_and()
+            expr = BinaryOpNode(expr, "||", right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_logical_and(self) -> ASTNode:
+        expr = self._parse_bitwise_or()
+        while self._match(TokenType.LOGICAL_AND):
+            right = self._parse_bitwise_or()
+            expr = BinaryOpNode(expr, "&&", right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_bitwise_or(self) -> ASTNode:
+        expr = self._parse_bitwise_xor()
+        while self._match(TokenType.PIPE):
+            right = self._parse_bitwise_xor()
+            expr = BinaryOpNode(expr, "|", right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_bitwise_xor(self) -> ASTNode:
+        expr = self._parse_bitwise_and()
+        while self._match(TokenType.CARET):
+            right = self._parse_bitwise_and()
+            expr = BinaryOpNode(expr, "^", right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_bitwise_and(self) -> ASTNode:
+        expr = self._parse_equality()
+        while self._match(TokenType.AMP):
+            right = self._parse_equality()
+            expr = BinaryOpNode(expr, "&", right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_equality(self) -> ASTNode:
+        expr = self._parse_relational()
+        while self._peek().type in (TokenType.EQ, TokenType.NE):
+            op_tok = self._advance_token()
+            right = self._parse_relational()
+            expr = BinaryOpNode(expr, op_tok.value, right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_relational(self) -> ASTNode:
+        expr = self._parse_shift()
+        while self._peek().type in (TokenType.LT, TokenType.GT, TokenType.LE, TokenType.GE):
+            op_tok = self._advance_token()
+            right = self._parse_shift()
+            expr = BinaryOpNode(expr, op_tok.value, right, line=expr.line, col=expr.col)
+        return expr
+
+    def _parse_shift(self) -> ASTNode:
         expr = self._parse_additive()
-        while self._peek().type in (TokenType.LT, TokenType.GT, TokenType.LE, TokenType.GE, TokenType.EQ, TokenType.NE):
+        while self._peek().type in (TokenType.SHL, TokenType.SHR):
             op_tok = self._advance_token()
             right = self._parse_additive()
             expr = BinaryOpNode(expr, op_tok.value, right, line=expr.line, col=expr.col)
@@ -735,7 +913,7 @@ class Parser:
         return expr
 
     def _parse_unary(self) -> ASTNode:
-        if self._peek().type in (TokenType.STAR, TokenType.BANG, TokenType.MINUS):
+        if self._peek().type in (TokenType.STAR, TokenType.BANG, TokenType.MINUS, TokenType.TILDE, TokenType.AMP):
             op_tok = self._advance_token()
             operand = self._parse_unary()
             return UnaryOpNode(op_tok.value, operand, line=op_tok.line, col=op_tok.col)
@@ -746,7 +924,10 @@ class Parser:
         while True:
             if self._match(TokenType.DOT):
                 member_tok = self._consume(TokenType.IDENTIFIER)
-                expr = MemberAccessNode(expr, member_tok.value, line=expr.line, col=expr.col)
+                expr = MemberAccessNode(expr, ".", member_tok.value, line=expr.line, col=expr.col)
+            elif self._match(TokenType.ARROW):
+                member_tok = self._consume(TokenType.IDENTIFIER)
+                expr = MemberAccessNode(expr, "->", member_tok.value, line=expr.line, col=expr.col)
             elif self._match(TokenType.LPAREN):
                 args: List[ASTNode] = []
                 if not self._check(TokenType.RPAREN):
@@ -762,6 +943,25 @@ class Parser:
 
     def _parse_primary(self) -> ASTNode:
         tok = self._peek()
+
+        if self._match(TokenType.SIZEOF) or (tok.type == TokenType.IDENTIFIER and tok.value == "sizeof"):
+            if tok.type == TokenType.IDENTIFIER:
+                self._advance_token()
+            start_tok = tok
+            self._consume(TokenType.LPAREN)
+
+            if self._peek().type == TokenType.IDENTIFIER and self._peek(1).type == TokenType.STAR:
+                base_ident = self._advance_token().value
+                stars = ""
+                while self._match(TokenType.STAR):
+                    stars += "*"
+                self._consume(TokenType.RPAREN)
+                return SizeofExprNode(f"{stars}{base_ident}", line=start_tok.line, col=start_tok.col)
+            else:
+                target_expr = self._parse_expression()
+                self._consume(TokenType.RPAREN)
+                return SizeofExprNode(target_expr, line=start_tok.line, col=start_tok.col)
+
         if self._match(TokenType.INT_LITERAL, TokenType.HEX_LITERAL):
             return LiteralNode(tok.value, "int", line=tok.line, col=tok.col)
         elif self._match(TokenType.STRING_LITERAL):
@@ -808,8 +1008,8 @@ class CCodeGenerator:
         self.struct_types: Set[str] = set()
         self.class_types: Set[str] = set()
         self.extern_functions: Set[str] = set()
-        
-        # Scoped Symbol Tracking
+        self.class_methods: Dict[str, str] = {}  # method_name -> ClassName
+
         self.declared_symbols: Set[str] = set()
         self.symbol_types: Dict[str, str] = {}
 
@@ -823,15 +1023,20 @@ class CCodeGenerator:
 
         spike_type = spike_type.strip()
         if spike_type.startswith("*"):
-            clean = spike_type[1:].strip()
+            ptr_depth = 0
+            while ptr_depth < len(spike_type) and spike_type[ptr_depth] == "*":
+                ptr_depth += 1
+
+            clean = spike_type[ptr_depth:].strip()
             is_const = clean.startswith("const")
             if is_const:
                 clean = clean[5:].strip()
             elif clean.startswith("mut"):
                 clean = clean[3:].strip()
-            
+
             c_base = self.map_type(clean)
-            return f"const {c_base}*" if is_const else f"{c_base}*"
+            c_stars = "*" * ptr_depth
+            return f"const {c_base}{c_stars}" if is_const else f"{c_base}{c_stars}"
 
         if spike_type in self.TYPE_MAP:
             return self.TYPE_MAP[spike_type]
@@ -872,7 +1077,6 @@ class CCodeGenerator:
     def generate(self, root: ProgramNode) -> str:
         self.output.clear()
 
-        # 1. Standard Header Directives
         if self.kernel_mode:
             self._emit("/* Generated by Spike Compiler - Standalone Kernel Mode */")
             self._emit("#include <stdint.h>")
@@ -886,29 +1090,53 @@ class CCodeGenerator:
             self._emit("#include <stdbool.h>")
             self._emit("")
 
-        # 2. Emit Top-Level c_decl Blocks (Verbatim C code, includes, macros)
+        # 1. Top-Level c_decl Blocks
         for decl in root.declarations:
             if isinstance(decl, CDeclBlockNode):
                 for line in decl.raw_lines:
                     self._emit(line)
                 self._emit("")
 
-        # 3. Collect Structs, Classes & Extern Functions
+        # 2. Collect Structs, Classes, Methods & Extern Functions
         for decl in root.declarations:
             if isinstance(decl, StructDeclNode):
                 self.struct_types.add(decl.name)
             elif isinstance(decl, ClassDeclNode):
                 self.class_types.add(decl.name)
+                for method in decl.methods:
+                    self.class_methods[method.name] = decl.name
             elif isinstance(decl, ExternDefNode):
                 self.extern_functions.add(decl.name)
 
-        # 4. Forward Struct & Class Declarations
+        # 3. Forward Declarations of Structs
         for decl in root.declarations:
             if isinstance(decl, StructDeclNode):
                 self._emit(f"struct {decl.name};")
             elif isinstance(decl, ClassDeclNode):
                 self._emit(f"struct {decl.name} {{ int _dummy; }};")
         if self.struct_types or self.class_types:
+            self._emit("")
+
+        # 4. Forward Declarations of Class Methods
+        has_methods = False
+        for decl in root.declarations:
+            if isinstance(decl, ClassDeclNode):
+                for method in decl.methods:
+                    c_ret = self.map_type(method.return_type)
+                    c_name = f"{decl.name}_{method.name}"
+                    if method.name == "main" and (method.is_export or method.is_static):
+                        c_name = "main" if not self.kernel_mode else "kernel_main"
+
+                    params_list = []
+                    for pname, ptype in method.params:
+                        c_type = self.map_type(ptype)
+                        params_list.append(f"{c_type} {pname}")
+                    params_str = ", ".join(params_list) if params_list else "void"
+
+                    export_prefix = "" if (method.is_export or c_name == "kernel_main") else "static "
+                    self._emit(f"{export_prefix}{c_ret} {c_name}({params_str});")
+                    has_methods = True
+        if has_methods:
             self._emit("")
 
         # 5. Emit 'extern def' Prototypes
@@ -918,7 +1146,7 @@ class CCodeGenerator:
         if self.extern_functions:
             self._emit("")
 
-        # 6. Generate All Other Top-Level Declarations
+        # 6. Generate Structs, Constants, Classes
         for decl in root.declarations:
             if not isinstance(decl, (CDeclBlockNode, ExternDefNode)):
                 self._visit(decl)
@@ -940,6 +1168,10 @@ class CCodeGenerator:
         for pname, ptype in node.params:
             c_type = self.map_type(ptype)
             params_list.append(f"{c_type} {pname}")
+
+        if node.is_variadic:
+            params_list.append("...")
+
         params_str = ", ".join(params_list) if params_list else "void"
         self._emit(f"extern {c_ret} {node.name}({params_str});")
 
@@ -1004,7 +1236,6 @@ class CCodeGenerator:
         self._emit(f"{c_type} {node.name} = {val};")
 
     def _visit_AssignStmtNode(self, node: AssignStmtNode):
-        # Strict enforcement: target identifier must be explicitly typed earlier
         if isinstance(node.target_expr, IdentifierNode):
             name = node.target_expr.name
             if name not in self.declared_symbols:
@@ -1016,11 +1247,18 @@ class CCodeGenerator:
 
         target = self._visit(node.target_expr)
         val = self._visit(node.value_expr)
-        self._emit(f"{target} = {val};")
+        self._emit(f"{target} {node.op} {val};")
 
     def _visit_ExprStmtNode(self, node: ExprStmtNode):
         expr_str = self._visit(node.expr)
         self._emit(f"{expr_str};")
+
+    def _visit_SizeofExprNode(self, node: SizeofExprNode) -> str:
+        if isinstance(node.target, str):
+            c_type = self.map_type(node.target)
+            return f"sizeof({c_type})"
+        inner = self._visit(node.target)
+        return f"sizeof({inner})"
 
     def _visit_CInlineBlockNode(self, node: CInlineBlockNode):
         for line in node.raw_lines:
@@ -1070,7 +1308,6 @@ class CCodeGenerator:
         else:
             self._emit("return;")
 
-    # Expression Visitors
     def _visit_BinaryOpNode(self, node: BinaryOpNode) -> str:
         left = self._visit(node.left)
         right = self._visit(node.right)
@@ -1095,19 +1332,16 @@ class CCodeGenerator:
                 return f"{var_type}_{node.member}"
 
         target_str = self._visit(node.target)
-        if self.is_pointer_type(node.target):
-            return f"{target_str}->{node.member}"
-
-        return f"{target_str}.{node.member}"
+        return f"{target_str}{node.op}{node.member}"
 
     def _visit_CallExprNode(self, node: CallExprNode) -> str:
         args_str = ", ".join(self._visit(a) for a in node.args)
 
-        # 1. External C function call or global function
+        # 1. External C function call
         if isinstance(node.callee, IdentifierNode) and node.callee.name in self.extern_functions:
             return f"{node.callee.name}({args_str})"
 
-        # 2. Struct Constructor: StructName(...) -> (struct StructName){ ... }
+        # 2. Struct Constructor
         if isinstance(node.callee, IdentifierNode):
             c_name = node.callee.name
             if c_name in self.struct_types:
@@ -1115,7 +1349,7 @@ class CCodeGenerator:
             if c_name in self.class_types:
                 return f"(struct {c_name}){{ 0 }}"
 
-        # 3. Class Method: ClassName.method(...) or instance.method(...)
+        # 3. Class Method (Explicit Member Access e.g. InodeCache.find(...))
         if isinstance(node.callee, MemberAccessNode):
             member = node.callee.member
             if isinstance(node.callee.target, IdentifierNode):
@@ -1125,6 +1359,13 @@ class CCodeGenerator:
                 var_type = self.symbol_types.get(tgt_name)
                 if var_type in self.class_types:
                     return f"{var_type}_{member}({args_str})"
+
+        # 4. Bare Class Method Call (e.g. inode_cache_find(...) called from main)
+        if isinstance(node.callee, IdentifierNode):
+            callee_name = node.callee.name
+            if callee_name in self.class_methods and callee_name != "main":
+                owner_class = self.class_methods[callee_name]
+                return f"{owner_class}_{callee_name}({args_str})"
 
         callee_str = self._visit(node.callee)
         return f"{callee_str}({args_str})"

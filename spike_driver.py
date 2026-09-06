@@ -185,7 +185,7 @@ def compile_spike(
             # USER MODE PIPELINE (Links spike_rt.h & spike_rt.c)
             # -------------------------------------------------------------
             header_path, rt_source_path = locate_runtime_files(driver_dir)
-            user_flags = [f"-O{opt_level}", "-Wall", "-Wextra"]
+            user_flags = [f"-I.", f"-O{opt_level}", "-Wall", "-Wextra"]
 
             if header_path:
                 user_flags.append(f"-I{header_path.parent}")

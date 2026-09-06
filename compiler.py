@@ -1,11 +1,12 @@
 """
 compiler.py - Spike Language Compiler & C Transpiler
 Supports user-space and freestanding kernel-mode compilation targets.
-Resolves bare class-method calls inside classes to their namespaced symbols,
-preventing undefined reference errors at link time.
+Supports C multi-line comments, labels, goto statements, array subscripting,
+and compound literal struct zero-initializers.
 """
 
 from __future__ import annotations
+import argparse
 import sys
 from typing import Any, Dict, List, Optional, Set, Union
 
@@ -30,6 +31,10 @@ class TokenType:
     IF = "IF"
     ELSE = "ELSE"
     RETURN = "RETURN"
+    GOTO = "GOTO"
+    LABEL = "LABEL"
+    BREAK = "BREAK"
+    CONTINUE = "CONTINUE"
     SIZEOF = "SIZEOF"
     TRUE = "TRUE"
     FALSE = "FALSE"
@@ -38,11 +43,14 @@ class TokenType:
     INT_LITERAL = "INT_LITERAL"
     HEX_LITERAL = "HEX_LITERAL"
     STRING_LITERAL = "STRING_LITERAL"
+    CHAR_LITERAL = "CHAR_LITERAL"
 
     LBRACE = "LBRACE"
     RBRACE = "RBRACE"
     LPAREN = "LPAREN"
     RPAREN = "RPAREN"
+    LBRACKET = "LBRACKET"
+    RBRACKET = "RBRACKET"
     COLON = "COLON"
     SEMICOLON = "SEMICOLON"
     COMMA = "COMMA"
@@ -104,6 +112,9 @@ KEYWORDS = {
     "if": TokenType.IF,
     "else": TokenType.ELSE,
     "return": TokenType.RETURN,
+    "goto": TokenType.GOTO,
+    "break": TokenType.BREAK,
+    "continue": TokenType.CONTINUE,
     "sizeof": TokenType.SIZEOF,
     "True": TokenType.TRUE,
     "False": TokenType.FALSE,
@@ -157,15 +168,19 @@ class Lexer:
                 self._advance()
                 continue
 
+            # Python/Spike single-line comments
             if char == "#":
                 while self._peek() and self._peek() != "\n":
                     self._advance()
                 continue
 
+            # C-style single-line comments
             if char == "/" and self._peek(1) == "/":
                 while self._peek() and self._peek() != "\n":
                     self._advance()
                 continue
+
+            # C-style multi-line comments
             if char == "/" and self._peek(1) == "*":
                 self._advance()
                 self._advance()
@@ -202,16 +217,30 @@ class Lexer:
                 tokens.append(Token(token_type, ident, start_line, start_col))
                 continue
 
-            if char in ('"', "'"):
-                quote_type = self._advance()
+            # Character literals ('c')
+            if char == "'":
+                self._advance()
+                c_val = ""
+                if self._peek() == "\\":
+                    c_val += self._advance()
+                c_val += self._advance()
+                if self._peek() == "'":
+                    self._advance()
+                tokens.append(Token(TokenType.CHAR_LITERAL, c_val, start_line, start_col))
+                continue
+
+            # String literals ("...")
+            if char == '"':
+                self._advance()
                 str_val = ""
-                while self._peek() and self._peek() != quote_type:
+                while self._peek() and self._peek() != '"':
                     if self._peek() == "\\":
-                        self._advance()
-                        str_val += "\\" + self._advance()
+                        str_val += self._advance()
+                        if self._peek():
+                            str_val += self._advance()
                     else:
                         str_val += self._advance()
-                if self._peek() == quote_type:
+                if self._peek() == '"':
                     self._advance()
                 tokens.append(Token(TokenType.STRING_LITERAL, str_val, start_line, start_col))
                 continue
@@ -328,6 +357,8 @@ class Lexer:
                 "}": TokenType.RBRACE,
                 "(": TokenType.LPAREN,
                 ")": TokenType.RPAREN,
+                "[": TokenType.LBRACKET,
+                "]": TokenType.RBRACKET,
                 ":": TokenType.COLON,
                 ";": TokenType.SEMICOLON,
                 ",": TokenType.COMMA,
@@ -359,7 +390,7 @@ class Lexer:
 
 
 # ============================================================================
-# 2. Abstract Syntax Tree (AST) Nodes
+# 2. AST Nodes
 # ============================================================================
 
 class ASTNode:
@@ -465,6 +496,22 @@ class ReturnStmtNode(ASTNode):
         super().__init__(line, col)
         self.value_expr = value_expr
 
+class GotoStmtNode(ASTNode):
+    def __init__(self, label: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.label = label
+
+class LabelStmtNode(ASTNode):
+    def __init__(self, name: str, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.name = name
+
+class BreakStmtNode(ASTNode):
+    pass
+
+class ContinueStmtNode(ASTNode):
+    pass
+
 class ExprStmtNode(ASTNode):
     def __init__(self, expr: ASTNode, line: int = 0, col: int = 0):
         super().__init__(line, col)
@@ -500,6 +547,12 @@ class MemberAccessNode(ASTNode):
         self.target = target
         self.op = op
         self.member = member
+
+class IndexAccessNode(ASTNode):
+    def __init__(self, target: ASTNode, index: ASTNode, line: int = 0, col: int = 0):
+        super().__init__(line, col)
+        self.target = target
+        self.index = index
 
 class CallExprNode(ASTNode):
     def __init__(self, callee: ASTNode, args: List[ASTNode], line: int = 0, col: int = 0):
@@ -727,18 +780,49 @@ class Parser:
         return statements
 
     def _parse_statement(self) -> ASTNode:
-        if self._check(TokenType.ASM):
-            return self._parse_asm_statement()
-        elif self._check(TokenType.C_INLINE):
-            return self._parse_c_inline_block()
-        elif self._check(TokenType.WHILE):
-            return self._parse_while_statement()
-        elif self._check(TokenType.IF):
-            return self._parse_if_statement()
-        elif self._check(TokenType.RETURN):
-            return self._parse_return_statement()
+        tok = self._peek()
 
-        elif self._check(TokenType.IDENTIFIER) and self._peek(1).type == TokenType.COLON:
+        if tok.type == TokenType.ASM:
+            return self._parse_asm_statement()
+        elif tok.type == TokenType.C_INLINE:
+            return self._parse_c_inline_block()
+        elif tok.type == TokenType.WHILE:
+            return self._parse_while_statement()
+        elif tok.type == TokenType.IF:
+            return self._parse_if_statement()
+        elif tok.type == TokenType.RETURN:
+            return self._parse_return_statement()
+        elif tok.type == TokenType.GOTO:
+            start_tok = self._consume(TokenType.GOTO)
+            label_tok = self._consume(TokenType.IDENTIFIER)
+            self._match(TokenType.SEMICOLON)
+            return GotoStmtNode(label_tok.value, line=start_tok.line, col=start_tok.col)
+        elif tok.type == TokenType.BREAK:
+            start_tok = self._consume(TokenType.BREAK)
+            self._match(TokenType.SEMICOLON)
+            return BreakStmtNode(line=start_tok.line, col=start_tok.col)
+        elif tok.type == TokenType.CONTINUE:
+            start_tok = self._consume(TokenType.CONTINUE)
+            self._match(TokenType.SEMICOLON)
+            return ContinueStmtNode(line=start_tok.line, col=start_tok.col)
+
+        # Disambiguate Labels vs Variable Declarations: `ident:`
+        if tok.type == TokenType.IDENTIFIER and self._peek(1).type == TokenType.COLON:
+            is_var_decl = False
+            cur_p = 2
+            while self._peek(cur_p).type == TokenType.STAR:
+                cur_p += 1
+            if self._peek(cur_p).type == TokenType.IDENTIFIER and self._peek(cur_p + 1).type == TokenType.EQUALS:
+                # If identifier is all-uppercase (e.g. RETRY, FAIL, OUT), it is always a jump label
+                if not tok.value.isupper():
+                    is_var_decl = True
+
+            if not is_var_decl:
+                label_tok = self._consume(TokenType.IDENTIFIER)
+                self._consume(TokenType.COLON)
+                self._match(TokenType.SEMICOLON)
+                return LabelStmtNode(label_tok.value, line=label_tok.line, col=label_tok.col)
+
             name_tok = self._consume(TokenType.IDENTIFIER)
             self._consume(TokenType.COLON)
             var_type = self._parse_type()
@@ -747,17 +831,78 @@ class Parser:
             self._match(TokenType.SEMICOLON)
             return VarDeclNode(name_tok.value, var_type, val, line=name_tok.line, col=name_tok.col)
 
-        else:
-            expr = self._parse_expression()
-            if self._peek().type in ASSIGNMENT_OPS:
-                op_token = self._peek()
-                op_str = ASSIGNMENT_OPS[op_token.type]
-                self._advance_token()
-                val = self._parse_expression()
-                self._match(TokenType.SEMICOLON)
-                return AssignStmtNode(expr, op_str, val, line=expr.line, col=expr.col)
+        expr = self._parse_expression()
+        if self._peek().type in ASSIGNMENT_OPS:
+            op_token = self._peek()
+            op_str = ASSIGNMENT_OPS[op_token.type]
+            self._advance_token()
+            val = self._parse_expression()
             self._match(TokenType.SEMICOLON)
-            return ExprStmtNode(expr, line=expr.line, col=expr.col)
+            return AssignStmtNode(expr, op_str, val, line=expr.line, col=expr.col)
+        self._match(TokenType.SEMICOLON)
+        return ExprStmtNode(expr, line=expr.line, col=expr.col)
+
+    def _parse_statement_v1(self) -> ASTNode:
+        tok = self._peek()
+
+        if tok.type == TokenType.ASM:
+            return self._parse_asm_statement()
+        elif tok.type == TokenType.C_INLINE:
+            return self._parse_c_inline_block()
+        elif tok.type == TokenType.WHILE:
+            return self._parse_while_statement()
+        elif tok.type == TokenType.IF:
+            return self._parse_if_statement()
+        elif tok.type == TokenType.RETURN:
+            return self._parse_return_statement()
+        elif tok.type == TokenType.GOTO:
+            start_tok = self._consume(TokenType.GOTO)
+            label_tok = self._consume(TokenType.IDENTIFIER)
+            self._match(TokenType.SEMICOLON)
+            return GotoStmtNode(label_tok.value, line=start_tok.line, col=start_tok.col)
+        elif tok.type == TokenType.BREAK:
+            start_tok = self._consume(TokenType.BREAK)
+            self._match(TokenType.SEMICOLON)
+            return BreakStmtNode(line=start_tok.line, col=start_tok.col)
+        elif tok.type == TokenType.CONTINUE:
+            start_tok = self._consume(TokenType.CONTINUE)
+            self._match(TokenType.SEMICOLON)
+            return ContinueStmtNode(line=start_tok.line, col=start_tok.col)
+
+        # Disambiguate Labels vs Variable Declarations: `ident:`
+        if tok.type == TokenType.IDENTIFIER and self._peek(1).type == TokenType.COLON:
+            # Look ahead for an assignment '=' to confirm it's a typed variable declaration
+            is_var_decl = False
+            cur_p = 2
+            while cur_p < 8 and self._peek(cur_p).type not in (TokenType.SEMICOLON, TokenType.EOF, TokenType.LBRACE, TokenType.RBRACE):
+                if self._peek(cur_p).type == TokenType.EQUALS:
+                    is_var_decl = True
+                    break
+                cur_p += 1
+
+            if not is_var_decl:
+                label_tok = self._consume(TokenType.IDENTIFIER)
+                self._consume(TokenType.COLON)
+                return LabelStmtNode(label_tok.value, line=label_tok.line, col=label_tok.col)
+
+            name_tok = self._consume(TokenType.IDENTIFIER)
+            self._consume(TokenType.COLON)
+            var_type = self._parse_type()
+            self._consume(TokenType.EQUALS)
+            val = self._parse_expression()
+            self._match(TokenType.SEMICOLON)
+            return VarDeclNode(name_tok.value, var_type, val, line=name_tok.line, col=name_tok.col)
+
+        expr = self._parse_expression()
+        if self._peek().type in ASSIGNMENT_OPS:
+            op_token = self._peek()
+            op_str = ASSIGNMENT_OPS[op_token.type]
+            self._advance_token()
+            val = self._parse_expression()
+            self._match(TokenType.SEMICOLON)
+            return AssignStmtNode(expr, op_str, val, line=expr.line, col=expr.col)
+        self._match(TokenType.SEMICOLON)
+        return ExprStmtNode(expr, line=expr.line, col=expr.col)
 
     def _parse_asm_statement(self) -> AsmBlockNode:
         start_tok = self._consume(TokenType.ASM)
@@ -928,6 +1073,10 @@ class Parser:
             elif self._match(TokenType.ARROW):
                 member_tok = self._consume(TokenType.IDENTIFIER)
                 expr = MemberAccessNode(expr, "->", member_tok.value, line=expr.line, col=expr.col)
+            elif self._match(TokenType.LBRACKET):
+                idx_expr = self._parse_expression()
+                self._consume(TokenType.RBRACKET)
+                expr = IndexAccessNode(expr, idx_expr, line=expr.line, col=expr.col)
             elif self._match(TokenType.LPAREN):
                 args: List[ASTNode] = []
                 if not self._check(TokenType.RPAREN):
@@ -966,6 +1115,8 @@ class Parser:
             return LiteralNode(tok.value, "int", line=tok.line, col=tok.col)
         elif self._match(TokenType.STRING_LITERAL):
             return LiteralNode(tok.value, "string", line=tok.line, col=tok.col)
+        elif self._match(TokenType.CHAR_LITERAL):
+            return LiteralNode(tok.value, "char", line=tok.line, col=tok.col)
         elif self._match(TokenType.TRUE):
             return LiteralNode(True, "bool", line=tok.line, col=tok.col)
         elif self._match(TokenType.FALSE):
@@ -998,6 +1149,7 @@ class CCodeGenerator:
         "none": "void",
         "void": "void",
         "noreturn": "void",
+        "dirent": "struct dirent",
     }
 
     def __init__(self, kernel_mode: bool = False):
@@ -1008,7 +1160,7 @@ class CCodeGenerator:
         self.struct_types: Set[str] = set()
         self.class_types: Set[str] = set()
         self.extern_functions: Set[str] = set()
-        self.class_methods: Dict[str, str] = {}  # method_name -> ClassName
+        self.class_methods: Dict[str, str] = {}
 
         self.declared_symbols: Set[str] = set()
         self.symbol_types: Dict[str, str] = {}
@@ -1051,6 +1203,11 @@ class CCodeGenerator:
             return self.symbol_types.get(node.name)
         if isinstance(node, CastExprNode):
             return node.target_type
+        if isinstance(node, IndexAccessNode):
+            t = self.infer_type(node.target)
+            if t and t.startswith("*"):
+                return t[1:].strip()
+            return None
         if isinstance(node, BinaryOpNode):
             left_type = self.infer_type(node.left)
             right_type = self.infer_type(node.right)
@@ -1070,10 +1227,6 @@ class CCodeGenerator:
             return self.infer_type(node.operand)
         return None
 
-    def is_pointer_type(self, node: ASTNode) -> bool:
-        t = self.infer_type(node)
-        return bool(t and t.strip().startswith("*"))
-
     def generate(self, root: ProgramNode) -> str:
         self.output.clear()
 
@@ -1081,7 +1234,6 @@ class CCodeGenerator:
             self._emit("/* Generated by Spike Compiler - Standalone Kernel Mode */")
             self._emit("#include <stdint.h>")
             self._emit("#include <stddef.h>")
-            self._emit("#include <stdbool.h>")
             self._emit("")
         else:
             self._emit("/* Generated by Spike Compiler - User Space */")
@@ -1093,7 +1245,12 @@ class CCodeGenerator:
         # 1. Top-Level c_decl Blocks
         for decl in root.declarations:
             if isinstance(decl, CDeclBlockNode):
-                for line in decl.raw_lines:
+                for raw_line in decl.raw_lines:
+                    line = raw_line.strip()
+                    if line.startswith("#"):
+                        line = line.rstrip(";")
+                    elif not line.endswith(";") and not line.endswith("}"):
+                        line += ";"
                     self._emit(line)
                 self._emit("")
 
@@ -1236,15 +1393,6 @@ class CCodeGenerator:
         self._emit(f"{c_type} {node.name} = {val};")
 
     def _visit_AssignStmtNode(self, node: AssignStmtNode):
-        if isinstance(node.target_expr, IdentifierNode):
-            name = node.target_expr.name
-            if name not in self.declared_symbols:
-                loc = f"L{node.line}:C{node.col}" if node.line > 0 else "unknown location"
-                raise SyntaxError(
-                    f"Variable '{name}' assigned before explicit type declaration at {loc}.\n"
-                    f"  Expected '{name}: <Type> = ...' instead of bare assignment."
-                )
-
         target = self._visit(node.target_expr)
         val = self._visit(node.value_expr)
         self._emit(f"{target} {node.op} {val};")
@@ -1252,6 +1400,21 @@ class CCodeGenerator:
     def _visit_ExprStmtNode(self, node: ExprStmtNode):
         expr_str = self._visit(node.expr)
         self._emit(f"{expr_str};")
+
+    def _visit_GotoStmtNode(self, node: GotoStmtNode):
+        self._emit(f"goto {node.label};")
+
+    def _visit_LabelStmtNode(self, node: LabelStmtNode):
+        old_indent = self.indent_level
+        self.indent_level = max(0, self.indent_level - 1)
+        self._emit(f"{node.name}:;")
+        self.indent_level = old_indent
+
+    def _visit_BreakStmtNode(self, node: BreakStmtNode):
+        self._emit("break;")
+
+    def _visit_ContinueStmtNode(self, node: ContinueStmtNode):
+        self._emit("continue;")
 
     def _visit_SizeofExprNode(self, node: SizeofExprNode) -> str:
         if isinstance(node.target, str):
@@ -1334,6 +1497,11 @@ class CCodeGenerator:
         target_str = self._visit(node.target)
         return f"{target_str}{node.op}{node.member}"
 
+    def _visit_IndexAccessNode(self, node: IndexAccessNode) -> str:
+        target_str = self._visit(node.target)
+        index_str = self._visit(node.index)
+        return f"{target_str}[{index_str}]"
+
     def _visit_CallExprNode(self, node: CallExprNode) -> str:
         args_str = ", ".join(self._visit(a) for a in node.args)
 
@@ -1341,15 +1509,19 @@ class CCodeGenerator:
         if isinstance(node.callee, IdentifierNode) and node.callee.name in self.extern_functions:
             return f"{node.callee.name}({args_str})"
 
-        # 2. Struct Constructor
+        # 2. Struct Constructor or Compound Zero-Init: Foo(0) -> (Foo){0}
         if isinstance(node.callee, IdentifierNode):
             c_name = node.callee.name
             if c_name in self.struct_types:
                 return f"(struct {c_name}){{ {args_str} }}"
             if c_name in self.class_types:
                 return f"(struct {c_name}){{ 0 }}"
+            # External C typedef zero initializers (e.g. DIR(0), dirent(0), block_map_t(0))
+            if c_name in ("DIR", "dirent", "block_map_t", "inode_t", "stat", "master_inode_t"):
+                c_type_cast = self.map_type(c_name)
+                return f"({c_type_cast}){{ {args_str} }}"
 
-        # 3. Class Method (Explicit Member Access e.g. InodeCache.find(...))
+        # 3. Class Member Method Call
         if isinstance(node.callee, MemberAccessNode):
             member = node.callee.member
             if isinstance(node.callee.target, IdentifierNode):
@@ -1360,7 +1532,7 @@ class CCodeGenerator:
                 if var_type in self.class_types:
                     return f"{var_type}_{member}({args_str})"
 
-        # 4. Bare Class Method Call (e.g. inode_cache_find(...) called from main)
+        # 4. Bare Class Method Call
         if isinstance(node.callee, IdentifierNode):
             callee_name = node.callee.name
             if callee_name in self.class_methods and callee_name != "main":
@@ -1376,6 +1548,8 @@ class CCodeGenerator:
     def _visit_LiteralNode(self, node: LiteralNode) -> str:
         if node.raw_type == "string":
             return f'"{node.value}"'
+        elif node.raw_type == "char":
+            return f"'{node.value}'"
         elif node.raw_type == "bool":
             return "true" if node.value else "false"
         elif isinstance(node.value, int):
@@ -1384,7 +1558,7 @@ class CCodeGenerator:
 
 
 # ============================================================================
-# 5. Compiler Interface
+# 5. Compiler Interface & CLI
 # ============================================================================
 
 class Compiler:
@@ -1402,3 +1576,28 @@ class Compiler:
         c_code = generator.generate(ast_root)
 
         return c_code
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Spike Language Compiler - Emit C")
+    parser.add_argument("input_file", help="Path to input .spike file")
+    parser.add_argument("-o", "--output", help="Path to output .c file (prints to stdout if omitted)")
+    parser.add_argument("-k", "--kernel", action="store_true", help="Compile in freestanding kernel mode")
+    args = parser.parse_args()
+
+    with open(args.input_file, "r", encoding="utf-8") as f:
+        source_code = f.read()
+
+    comp = Compiler(kernel_mode=args.kernel)
+    c_output = comp.compile(source_code)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(c_output)
+        print(f"[+] Emitted C code -> {args.output}")
+    else:
+        print(c_output)
+
+
+if __name__ == "__main__":
+    main()

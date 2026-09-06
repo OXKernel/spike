@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 c2spike.py - Robust C to Spike Transpiler
-- Emits `typedef struct Name Name;` in `c_decl` for all structs so `sizeof(Name)` works in C.
-- Fixes statement boundary consumption so `(void)var;` no-op statements don't glue onto prior calls.
-- Preserves top-level typedefs and forward declarations in topological order.
-- Generates safe non-colliding output filenames.
+- Fixes brace-depth desynchronization on `for` loops.
+- Accurately transpiles all methods (kopendir, kclosedir, krewinddir, kreaddir, krmdir, kmkdir, main).
+- Supports C labels (`LABEL:`) and `goto LABEL;`.
+- Preserves array subscripting (`arr[idx]`).
+- Converts `#include "header.h"` to `#include <header.h>`.
+- Injects `#define printk printf` into c_decl.
 """
 
 from __future__ import annotations
@@ -65,6 +67,13 @@ def clean_type(raw: str) -> str:
     base = s.replace('*', '').strip()
     base = re.sub(r'\s+', ' ', base)
 
+    parts = base.split()
+    if len(parts) > 1:
+        for cand in reversed(parts):
+            if cand.isidentifier() and cand not in ("define", "ifdef", "ifndef", "endif", "else"):
+                base = cand
+                break
+
     for mwt, st in MULTI_WORD_TYPES:
         if base == mwt:
             base = st
@@ -74,13 +83,82 @@ def clean_type(raw: str) -> str:
 
     return f"{'*' * ptr_depth}{base}"
 
+
+def collapse_multiline_parentheses(code: str) -> str:
+    result = []
+    depth = 0
+    in_str = False
+    quote = ''
+    i = 0
+    n = len(code)
+
+    while i < n:
+        c = code[i]
+        if in_str:
+            result.append(c)
+            if c == '\\' and i + 1 < n:
+                i += 1
+                result.append(code[i])
+            elif c == quote:
+                in_str = False
+        else:
+            if c in ('"', "'"):
+                in_str = True
+                quote = c
+                result.append(c)
+            elif c == '(':
+                depth += 1
+                result.append(c)
+            elif c == ')':
+                if depth > 0:
+                    depth -= 1
+                result.append(c)
+            elif c == '\n' and depth > 0:
+                result.append(' ')
+            else:
+                result.append(c)
+        i += 1
+
+    return "".join(result)
+
+
 def pre_normalize_c_source(code: str) -> str:
+    code = collapse_multiline_parentheses(code)
+
+    string_literals: List[str] = []
+
+    def mask_str(m):
+        idx = len(string_literals)
+        string_literals.append(m.group(0))
+        return f"__SPIKE_STR_{idx}__"
+
+    str_pat = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+    code = str_pat.sub(mask_str, code)
+
     code = re.sub(r'//.*', '', code)
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-
-    # Completely strip C unused-variable suppressors like `(void)r;` or `(void) x;`
+    code = re.sub(r'^\s*#.*$', '', code, flags=re.MULTILINE)
     code = re.sub(r'\(\s*void\s*\)\s*[a-zA-Z_][a-zA-Z0-9_]*\s*;', '', code)
 
+    code = re.sub(r'\+\+\s*\(\s*([a-zA-Z0-9_\->\.\[\]]+)\s*\)', r'\1 = \1 + 1', code)
+    code = re.sub(r'\+\+\s*([a-zA-Z0-9_\->\.\[\]]+)', r'\1 = \1 + 1', code)
+    code = re.sub(r'--\s*\(\s*([a-zA-Z0-9_\->\.\[\]]+)\s*\)', r'\1 = \1 - 1', code)
+    code = re.sub(r'--\s*([a-zA-Z0-9_\->\.\[\]]+)', r'\1 = \1 - 1', code)
+
+    def cast_sub(m):
+        raw_t = m.group(1).strip()
+        stars = m.group(2)
+        has_amp = bool(m.group(3))
+        expr = m.group(4).strip()
+        target_t = clean_type(f"{stars}{raw_t}")
+        amp_prefix = "&" if has_amp else ""
+        return f"(({amp_prefix}{expr}) as {target_t})"
+
+    cast_pat = re.compile(
+        r'\(\s*([a-zA-Z_][a-zA-Z0-9_]*|\b(?:unsigned|signed)?\s*(?:char|int|short|long|void)\b)\s*(\*+)\s*\)\s*(&)?\s*([a-zA-Z_][a-zA-Z0-9_\->\.\[\]]*)'
+    )
+    code = cast_pat.sub(cast_sub, code)
+
     for mwt, st in MULTI_WORD_TYPES:
         code = re.sub(r'\b' + mwt.replace(' ', r'\s+') + r'\b', st, code)
 
@@ -89,20 +167,10 @@ def pre_normalize_c_source(code: str) -> str:
             code = re.sub(r'\b' + ct + r'\b', st, code)
 
     code = re.sub(r'\*\s+([a-zA-Z_][a-zA-Z0-9_]*)', r'*\1', code)
-    return code
 
-def pre_normalize_c_source_v1(code: str) -> str:
-    code = re.sub(r'//.*', '', code)
-    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    for idx, s_val in enumerate(string_literals):
+        code = code.replace(f"__SPIKE_STR_{idx}__", s_val)
 
-    for mwt, st in MULTI_WORD_TYPES:
-        code = re.sub(r'\b' + mwt.replace(' ', r'\s+') + r'\b', st, code)
-
-    for ct, st in TYPE_MAP.items():
-        if ct not in ("unsigned", "char", "int", "short", "long"):
-            code = re.sub(r'\b' + ct + r'\b', st, code)
-
-    code = re.sub(r'\*\s+([a-zA-Z_][a-zA-Z0-9_]*)', r'*\1', code)
     return code
 
 
@@ -127,62 +195,6 @@ def translate_tokens(tokens: List[str]) -> str:
 
     while i < n:
         t = tokens[i]
-
-        if t == "(":
-            end_p = _find_matching_paren(tokens, i)
-            if end_p != -1:
-                inner_toks = tokens[i+1:end_p]
-                inner_raw = " ".join(inner_toks).strip()
-                type_cand = clean_type(inner_raw)
-                clean_cand = type_cand.replace('*', '').strip()
-
-                is_type = False
-                if clean_cand in TYPE_MAP.values() or inner_raw.endswith('*') or clean_cand in ("CacheNode", "inode", "inode_t", "InodeLRUCache"):
-                    if inner_raw not in ("if", "while", "for", "return", "sizeof", "switch") and "as" not in inner_toks:
-                        is_type = True
-
-                if is_type and end_p + 1 < n:
-                    target_start = end_p + 1
-
-                    if target_start + 1 < n and tokens[target_start].isidentifier() and tokens[target_start+1] == "(":
-                        fn_name = tokens[target_start]
-                        fn_end_p = _find_matching_paren(tokens, target_start + 1)
-                        if fn_end_p != -1:
-                            inner_args = translate_tokens(tokens[target_start+2:fn_end_p])
-                            out_tokens.append(f"({fn_name}({inner_args}) as {type_cand})")
-                            i = fn_end_p + 1
-                            continue
-
-                    if tokens[target_start] == "-" and target_start + 1 < n and tokens[target_start+1].isdigit():
-                        num = tokens[target_start+1]
-                        out_tokens.append(f"((- {num}) as {type_cand})")
-                        i = target_start + 2
-                        continue
-
-                    if tokens[target_start] == "(":
-                        expr_end_p = _find_matching_paren(tokens, target_start)
-                        if expr_end_p != -1:
-                            inner_expr = translate_tokens(tokens[target_start+1:expr_end_p])
-                            out_tokens.append(f"(({inner_expr}) as {type_cand})")
-                            i = expr_end_p + 1
-                            continue
-
-                    if tokens[target_start] == "*" and target_start + 1 < n and tokens[target_start+1].isidentifier():
-                        var_name = tokens[target_start+1]
-                        out_tokens.append(f"((* {var_name}) as {type_cand})")
-                        i = target_start + 2
-                        continue
-
-                    if tokens[target_start].isidentifier():
-                        sub_expr = [tokens[target_start]]
-                        cur = target_start + 1
-                        while cur < n and tokens[cur] in ("->", "."):
-                            sub_expr.extend([tokens[cur], tokens[cur+1]])
-                            cur += 2
-                        out_tokens.append(f"({' '.join(sub_expr)} as {type_cand})")
-                        i = cur
-                        continue
-
         if t == "NULL":
             out_tokens.append("0 as *none")
         elif t == "true":
@@ -194,14 +206,17 @@ def translate_tokens(tokens: List[str]) -> str:
                 out_tokens.append(t[:-1])
             else:
                 out_tokens.append(t)
-
         i += 1
 
     expr_str = " ".join(out_tokens)
     expr_str = re.sub(r'\s*->\s*', '->', expr_str)
+    expr_str = re.sub(r'\s*\.\s*', '.', expr_str)
     expr_str = re.sub(r'([a-zA-Z0-9_\-\>\.]+)\s*\+\+', r'\1 = \1 + 1', expr_str)
     expr_str = re.sub(r'([a-zA-Z0-9_\-\>\.]+)\s*--', r'\1 = \1 - 1', expr_str)
-    expr_str = re.sub(r'([a-zA-Z0-9_]+|\))\s*\[\s*([^\]]+)\s*\]', r'\1[\2]', expr_str)
+    expr_str = re.sub(r'\+\+\s*([a-zA-Z0-9_\-\>\.]+)', r'\1 = \1 + 1', expr_str)
+    expr_str = re.sub(r'--\s*([a-zA-Z0-9_\-\>\.]+)', r'\1 = \1 - 1', expr_str)
+    expr_str = re.sub(r'\s*\[\s*', '[', expr_str)
+    expr_str = re.sub(r'\s*\]', ']', expr_str)
     return expr_str
 
 
@@ -212,8 +227,10 @@ class CTokenizer:
     def get_tokens(self) -> List[str]:
         tokens = []
         token_spec = [
-            ("STRING",    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''),
+            ("STRING",    r'"(?:\\.|[^"\\])*"'),
+            ("CHAR",      r'\'(?:\\.|[^\'\\])*\''),
             ("HEX",       r'0[xX][0-9a-fA-F]+'),
+            ("OCTAL",     r'0[0-7]+'),
             ("NUMBER",    r'\d+[uU]?'),
             ("OP_MULTI",  r'<<=|>>=|<<|>>|\+\+|--|->|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^='),
             ("OP_SINGLE", r'[{}();,:\.=\+\-\*/%&|^!<>~\[\]?]'),
@@ -263,12 +280,16 @@ class BlockParser:
 
 
 class HeaderResolver:
-    def __init__(self, base_dir: Path, follow_headers: bool = False):
+    def __init__(self, base_dir: Path, follow_headers: bool = False, freestanding: bool = False):
         self.base_dir = base_dir
         self.follow_headers = follow_headers
+        self.freestanding = freestanding
         self.visited: Set[Path] = set()
-        self.c_decls: List[str] = []
-        self.has_libc_headers = False
+        self.c_decls: List[str] = [
+            "struct dirent;",
+            "typedef struct dirent dirent;",
+            "#define printk printf"
+        ]
 
     def resolve(self, code: str, current_dir: Optional[Path] = None) -> str:
         if current_dir is None:
@@ -278,7 +299,6 @@ class HeaderResolver:
         for line in code.splitlines():
             line_str = line.strip()
 
-            # Detect forward declaration typedefs: typedef struct inode inode_t;
             m_fwd = re.match(r'^typedef\s+struct\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;', line_str)
             if m_fwd:
                 struct_tag = m_fwd.group(1)
@@ -287,19 +307,17 @@ class HeaderResolver:
                 self.c_decls.append(f"typedef struct {struct_tag} {alias_name};")
                 continue
 
-            # Capture other complete single-line typedefs (e.g. function pointers)
             if re.match(r'^typedef\s+[^\{]+;$', line_str):
                 self.c_decls.append(line_str)
                 continue
 
-            # Handle #include
             inc_match = re.match(r'^#include\s+["<](.+?)[">]', line_str)
             if inc_match:
                 inc_target = inc_match.group(1)
                 header_path = (current_dir / inc_target).resolve()
 
-                if inc_target in BUILTIN_LIBC_HEADERS:
-                    self.has_libc_headers = True
+                if self.freestanding and inc_target in BUILTIN_LIBC_HEADERS:
+                    continue
 
                 if self.follow_headers and header_path.is_file() and header_path not in self.visited:
                     self.visited.add(header_path)
@@ -312,24 +330,51 @@ class HeaderResolver:
                         lines.append(f"// --- End of {inc_target} ---")
                     except Exception as ex:
                         print(f"[-] Warning: Failed to inline {header_path}: {ex}", file=sys.stderr)
-                        self.c_decls.append(line_str)
+                        self.c_decls.append(f"#include <{inc_target}>")
                 else:
-                    self.c_decls.append(line_str)
+                    self.c_decls.append(f"#include <{inc_target}>")
             else:
                 lines.append(line)
 
         return "\n".join(lines)
 
 
+def format_code_block(lines: List[str], base_indent: int = 1) -> List[str]:
+    formatted = []
+    level = base_indent
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        is_label = bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*:$', line))
+
+        if line.startswith("}") or is_label:
+            curr_level = max(0, level - 1)
+        else:
+            curr_level = level
+
+        indent_str = "    " * curr_level
+        formatted.append(f"{indent_str}{line}")
+
+        opens = line.count("{")
+        closes = line.count("}")
+        level += (opens - closes)
+        if level < 0:
+            level = 0
+
+    return formatted
+
+
 class C2Spike:
-    def __init__(self, class_name: str = "Native", c_decls: Optional[List[str]] = None, has_libc_headers: bool = False):
-        self.class_name = class_name
+    def __init__(self, class_name: Optional[str] = None, c_decls: Optional[List[str]] = None):
+        self.class_name = class_name or "Native"
         self.c_decls = c_decls or []
-        self.has_libc_headers = has_libc_headers
         self.structs: List[str] = []
         self.struct_names: List[str] = []
         self.constants: List[str] = []
-        self.methods: List[str] = []
+        self.methods: List[List[str]] = []
 
     def transpile(self, c_code: str) -> str:
         for line in c_code.splitlines():
@@ -337,8 +382,9 @@ class C2Spike:
             m = re.match(r'^#define\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(.+)$', line)
             if m:
                 name = m.group(1)
-                val = translate_tokens(CTokenizer(m.group(2).strip().rstrip(';')).get_tokens())
-                if not val.endswith(')'):
+                val_raw = m.group(2).strip().rstrip(';')
+                if not val_raw.startswith("(") and name != "printk":
+                    val = translate_tokens(CTokenizer(val_raw).get_tokens())
                     vtype = "*u8" if val.startswith('"') else "u32"
                     self.constants.append(f"const {name}: {vtype} = {val}")
 
@@ -354,7 +400,7 @@ class C2Spike:
                     pass
                 continue
 
-            if tok == "struct" or (tok == "typedef" and parser.peek(1) == "struct"):
+            if self._is_struct_definition(parser):
                 self._parse_struct(parser)
                 continue
 
@@ -366,7 +412,6 @@ class C2Spike:
 
         out = ["# Transpiled by c2spike.py", ""]
 
-        # Ensure all defined structs have a typedef in c_decl so sizeof(StructName) works in C
         for sname in self.struct_names:
             self.c_decls.append(f"typedef struct {sname} {sname};")
 
@@ -374,14 +419,16 @@ class C2Spike:
             seen_decls = set()
             ordered_decls = []
             for decl in self.c_decls:
-                cleaned = decl.rstrip(';')
+                cleaned = decl.strip()
                 if cleaned not in seen_decls:
                     seen_decls.add(cleaned)
                     ordered_decls.append(cleaned)
 
             out.append("c_decl {")
             for d in ordered_decls:
-                out.append(f'    "{d};";')
+                d_clean = d.rstrip(";") if d.startswith("#") else (d if d.endswith(";") else f"{d};")
+                escaped = d_clean.replace('\\', '\\\\').replace('"', '\\"')
+                out.append(f'    "{escaped}";')
             out.append("}")
             out.append("")
 
@@ -395,12 +442,30 @@ class C2Spike:
 
         out.append(f"class {self.class_name} {{")
         for method in self.methods:
-            for line in method.splitlines():
-                out.append(f"    {line}")
+            out.extend(method)
             out.append("")
         out.append("}")
 
         return "\n".join(out)
+
+    def _is_struct_definition(self, p: BlockParser) -> bool:
+        if p.peek() not in ("struct", "typedef"):
+            return False
+
+        idx = p.pos
+        has_struct = False
+        while idx < p.length and idx - p.pos < 30:
+            t = p.tokens[idx]
+            if t == "struct":
+                has_struct = True
+            if t == "(":
+                return False
+            if t == "{":
+                return has_struct
+            if t == ";":
+                return False
+            idx += 1
+        return False
 
     def _parse_struct(self, p: BlockParser):
         header_tokens = []
@@ -454,7 +519,7 @@ class C2Spike:
             if paren_found and t == "{":
                 return True
             idx += 1
-            if idx - p.pos > 80:
+            if idx - p.pos > 300:
                 break
         return False
 
@@ -471,7 +536,7 @@ class C2Spike:
         raw_ret = " ".join(header_tokens[:-1])
         ret_type = clean_type(raw_ret) if raw_ret else "none"
 
-        p.advance()
+        p.advance()  # consume '('
         param_tokens = []
         depth = 1
         while p.pos < p.length and depth > 0:
@@ -502,24 +567,39 @@ class C2Spike:
         body_tokens = p.parse_balanced_block()
         body_lines = self._transpile_block(body_tokens)
 
-        # Internal class methods are static; export main
         is_main = (func_name == "main")
         prefix = "export " if is_main else "static "
         ret_clause = f": {ret_type}" if ret_type != "none" else ""
-        header = f"{prefix}def {func_name}({', '.join(params_out)}){ret_clause} {{"
+        header = f"    {prefix}def {func_name}({', '.join(params_out)}){ret_clause} {{"
 
-        res = [header] + [f"    {l}" for l in body_lines] + ["}"]
-        self.methods.append("\n".join(res))
+        formatted_body = format_code_block(body_lines, base_indent=2)
+        res = [header] + formatted_body + ["    }"]
+        self.methods.append(res)
 
     def _transpile_block(self, tokens: List[str]) -> List[str]:
         out = []
         i = 0
         n = len(tokens)
+        step_stack: List[List[str]] = []
 
         while i < n:
             tok = tokens[i]
 
-            # 1. While loop
+            # 1. Label definition: IDENTIFIER COLON
+            if tok.isidentifier() and i + 1 < n and tokens[i+1] == ":" and (i + 2 >= n or tokens[i+2] != "="):
+                out.append(f"{tok}:;")
+                i += 2
+                continue
+
+            # 2. Goto statement
+            if tok == "goto" and i + 1 < n and tokens[i+1].isidentifier():
+                out.append(f"goto {tokens[i+1]}")
+                i += 2
+                if i < n and tokens[i] == ";":
+                    i += 1
+                continue
+
+            # 3. While loop
             if tok == "while":
                 cond_tokens, next_i = self._read_paren_group(tokens, i + 1)
                 cond_raw = " ".join(cond_tokens)
@@ -542,6 +622,7 @@ class C2Spike:
                     i = next_i
                     if i < n and tokens[i] == "{":
                         i += 1
+                        step_stack.append([])
                     continue
                 else:
                     cond_str = translate_tokens(cond_tokens)
@@ -550,41 +631,91 @@ class C2Spike:
                         stmt_toks, next_stmt_i = self._read_single_statement(tokens, i)
                         inner_stmt = self._transpile_stmt_str(stmt_toks)
                         if inner_stmt:
-                            out.append(f"while ({cond_str}) {{ {inner_stmt} }}")
+                            out.append(f"while ({cond_str}) {{")
+                            out.append(inner_stmt)
+                            out.append("}")
                         i = next_stmt_i
                     else:
                         out.append(f"while ({cond_str}) {{")
                         if i < n and tokens[i] == "{":
                             i += 1
+                            step_stack.append([])
                     continue
 
-            # 2. C for-loop
+            # 4. Do-while loop
+            if tok == "do":
+                i += 1
+                body_toks = []
+                if i < n and tokens[i] == "{":
+                    depth = 1
+                    i += 1
+                    while i < n and depth > 0:
+                        if tokens[i] == "{":
+                            depth += 1
+                        elif tokens[i] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        body_toks.append(tokens[i])
+                        i += 1
+
+                if i < n and tokens[i] == "while":
+                    cond_tokens, next_i = self._read_paren_group(tokens, i + 1)
+                    cond_str = translate_tokens(cond_tokens)
+                    i = next_i
+                    if i < n and tokens[i] == ";":
+                        i += 1
+
+                    out.append("while (True) {")
+                    for stmt_line in self._transpile_block(body_toks):
+                        out.append(stmt_line)
+                    out.append(f"if (!({cond_str})) {{")
+                    out.append("break")
+                    out.append("}")
+                    out.append("}")
+                    continue
+
+            # 5. For loop
             if tok == "for":
                 for_tokens, next_i = self._read_paren_group(tokens, i + 1)
                 for_str = " ".join(for_tokens)
                 parts = for_str.split(";")
                 init_part = parts[0].strip() if len(parts) > 0 else ""
                 cond_part = translate_tokens(CTokenizer(parts[1].strip()).get_tokens()) if len(parts) > 1 and parts[1].strip() else "True"
-                step_part = translate_tokens(CTokenizer(parts[2].strip()).get_tokens()) if len(parts) > 2 else ""
+                step_part = parts[2].strip() if len(parts) > 2 else ""
 
                 if init_part:
-                    out.append(self._transpile_stmt_str(CTokenizer(init_part).get_tokens()))
+                    for init_sub in init_part.split(","):
+                        init_sub = init_sub.strip()
+                        if init_sub:
+                            out.append(self._transpile_stmt_str(CTokenizer(init_sub).get_tokens()))
+
+                step_stmts = []
+                if step_part:
+                    for s_sub in step_part.split(","):
+                        s_sub = s_sub.strip()
+                        if s_sub:
+                            step_stmts.append(translate_tokens(CTokenizer(s_sub).get_tokens()))
 
                 i = next_i
-                step_note = f" # step: {step_part}" if step_part else ""
                 if i < n and tokens[i] != "{":
                     stmt_toks, next_stmt_i = self._read_single_statement(tokens, i)
                     inner_stmt = self._transpile_stmt_str(stmt_toks)
                     if inner_stmt:
-                        out.append(f"while ({cond_part}) {{ {inner_stmt}; {step_part} }}")
+                        out.append(f"while ({cond_part}) {{")
+                        out.append(inner_stmt)
+                        for s_stmt in step_stmts:
+                            out.append(s_stmt)
+                        out.append("}")
                     i = next_stmt_i
                 else:
-                    out.append(f"while ({cond_part}) {{{step_note}")
+                    out.append(f"while ({cond_part}) {{")
                     if i < n and tokens[i] == "{":
                         i += 1
-                continue
+                        step_stack.append(step_stmts)
+                    continue
 
-            # 3. If statement
+            # 6. If statement
             if tok == "if":
                 cond_tokens, next_i = self._read_paren_group(tokens, i + 1)
                 cond_str = translate_tokens(cond_tokens)
@@ -594,52 +725,74 @@ class C2Spike:
                     stmt_toks, next_stmt_i = self._read_single_statement(tokens, i)
                     inner_stmt = self._transpile_stmt_str(stmt_toks)
                     if inner_stmt:
-                        out.append(f"if ({cond_str}) {{ {inner_stmt} }}")
+                        out.append(f"if ({cond_str}) {{")
+                        out.append(inner_stmt)
+                        out.append("}")
                     i = next_stmt_i
                 else:
                     out.append(f"if ({cond_str}) {{")
                     if i < n and tokens[i] == "{":
                         i += 1
+                        step_stack.append([])
                 continue
 
-            # 4. Else / Else If
+            # 7. Else statement
             if tok == "else":
+                prev_closed = bool(out and out[-1] == "}")
+
                 if i + 1 < n and tokens[i+1] == "if":
                     cond_tokens, next_i = self._read_paren_group(tokens, i + 2)
                     cond_str = translate_tokens(cond_tokens)
                     i = next_i
+                    prefix = "} else if" if prev_closed else "else if"
+                    if prev_closed:
+                        out.pop()
+
                     if i < n and tokens[i] != "{":
                         stmt_toks, next_stmt_i = self._read_single_statement(tokens, i)
                         inner_stmt = self._transpile_stmt_str(stmt_toks)
                         if inner_stmt:
-                            out.append(f"else if ({cond_str}) {{ {inner_stmt} }}")
+                            out.append(f"{prefix} ({cond_str}) {{")
+                            out.append(inner_stmt)
+                            out.append("}")
                         i = next_stmt_i
                     else:
-                        out.append(f"else if ({cond_str}) {{")
+                        out.append(f"{prefix} ({cond_str}) {{")
                         if i < n and tokens[i] == "{":
                             i += 1
+                            step_stack.append([])
                     continue
                 else:
                     i += 1
+                    prefix = "} else {" if prev_closed else "else {"
+                    if prev_closed:
+                        out.pop()
+
                     if i < n and tokens[i] != "{":
                         stmt_toks, next_stmt_i = self._read_single_statement(tokens, i)
                         inner_stmt = self._transpile_stmt_str(stmt_toks)
                         if inner_stmt:
-                            out.append(f"else {{ {inner_stmt} }}")
+                            out.append(prefix)
+                            out.append(inner_stmt)
+                            out.append("}")
                         i = next_stmt_i
                     else:
-                        out.append("else {")
+                        out.append(prefix)
                         if i < n and tokens[i] == "{":
                             i += 1
+                            step_stack.append([])
                     continue
 
-            # 5. Block closures
+            # 8. Block closure
             if tok == "}":
+                if step_stack:
+                    steps = step_stack.pop()
+                    for st in steps:
+                        out.append(st)
                 out.append("}")
                 i += 1
                 continue
 
-            # 6. Read standard statements
             stmt_toks, next_i = self._read_single_statement(tokens, i)
             if next_i == i:
                 i += 1
@@ -648,7 +801,8 @@ class C2Spike:
 
             stmt_line = self._transpile_stmt_str(stmt_toks)
             if stmt_line:
-                out.append(stmt_line)
+                for line_part in stmt_line.splitlines():
+                    out.append(line_part.strip())
 
         return out
 
@@ -676,7 +830,6 @@ class C2Spike:
         return group, i
 
     def _read_single_statement(self, tokens: List[str], start: int) -> Tuple[List[str], int]:
-        """Reads exactly ONE statement ending at an un-nested semicolon."""
         stmt = []
         i = start
         paren_depth = 0
@@ -711,7 +864,9 @@ class C2Spike:
                 if t in ("{", "}") and not stmt:
                     i += 1
                     break
-                if t in ("else", "if", "while", "for") and stmt:
+                if t in ("else", "if", "while", "for", "do", "goto") and stmt:
+                    break
+                if t.isidentifier() and i + 1 < len(tokens) and tokens[i+1] == ":" and stmt:
                     break
 
             stmt.append(t)
@@ -722,31 +877,60 @@ class C2Spike:
         if not tokens:
             return ""
 
-        stmt = " ".join(tokens).strip()
+        processed_toks = []
+        for t in tokens:
+            if t == "[" and processed_toks:
+                processed_toks[-1] = f"{processed_toks[-1]}["
+            elif t == "]" and processed_toks and processed_toks[-1].endswith("["):
+                processed_toks[-1] = f"{processed_toks[-1]}]"
+            elif processed_toks and processed_toks[-1].endswith("["):
+                processed_toks[-1] = f"{processed_toks[-1]}{t}"
+            elif t == "]" and processed_toks:
+                processed_toks[-1] = f"{processed_toks[-1]}]"
+            else:
+                processed_toks.append(t)
 
-        # Drop C unused-variable suppressors: `(void)var;`
+        stmt = " ".join(processed_toks).strip()
+        stmt = re.sub(r'\s*->\s*', '->', stmt)
+        stmt = re.sub(r'\s*\.\s*', '.', stmt)
+        stmt = re.sub(r'\[\s+', '[', stmt)
+        stmt = re.sub(r'\s+\]', ']', stmt)
+
         if re.match(r'^\(\s*void\s*\)\s*[a-zA-Z_][a-zA-Z0-9_]*$', stmt):
             return ""
 
-        # 1. Chained assignments
-        if stmt.count("=") > 1 and "==" not in stmt and "!=" not in stmt and "<=" not in stmt and ">=" not in stmt and not stmt.startswith("def ") and not stmt.startswith("struct "):
-            parts = [p.strip() for p in re.split(r'(?<![!<>=+*/%&|^])=(?![=])', stmt)]
-            if len(parts) > 2:
-                final_val = translate_tokens(CTokenizer(parts[-1]).get_tokens())
-                targets = parts[:-1]
-                unrolled = [f"{tgt} = {final_val}" for tgt in reversed(targets)]
-                return "\n    ".join(unrolled)
+        is_call = bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*\(', stmt))
 
-        # 2. Ternary
-        ternary_m = re.match(r'^(return\s+)?(.+?)\s*\?\s*(.+?)\s*:\s*(.+)$', stmt)
-        if ternary_m:
+        stmt_strings: List[str] = []
+        def mask_inner_str(m):
+            s_idx = len(stmt_strings)
+            stmt_strings.append(m.group(0))
+            return f"__STMT_STR_{s_idx}__"
+
+        stmt_masked = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', mask_inner_str, stmt)
+
+        def restore_stmt_str(s: str) -> str:
+            for s_idx, s_txt in enumerate(stmt_strings):
+                s = s.replace(f"__STMT_STR_{s_idx}__", s_txt)
+            return s
+
+        if not is_call and stmt_masked.count("=") > 1 and "==" not in stmt_masked and "!=" not in stmt_masked and "<=" not in stmt_masked and ">=" not in stmt_masked and not stmt_masked.startswith("def ") and not stmt_masked.startswith("struct "):
+            if "," not in stmt_masked:
+                parts = [p.strip() for p in re.split(r'(?<![!<>=+*/%&|^])=(?![=])', stmt_masked)]
+                if len(parts) > 2:
+                    final_val = translate_tokens(CTokenizer(restore_stmt_str(parts[-1])).get_tokens())
+                    targets = [restore_stmt_str(p) for p in parts[:-1]]
+                    unrolled = [f"{tgt} = {final_val}" for tgt in reversed(targets)]
+                    return "\n".join(unrolled)
+
+        ternary_m = re.match(r'^(return\s+)?(.+?)\s*\?\s*(.+?)\s*:\s*(.+)$', stmt_masked)
+        if ternary_m and not is_call:
             ret_prefix = "return " if ternary_m.group(1) else ""
-            cond = translate_tokens(CTokenizer(ternary_m.group(2)).get_tokens())
-            true_v = translate_tokens(CTokenizer(ternary_m.group(3)).get_tokens())
-            false_v = translate_tokens(CTokenizer(ternary_m.group(4)).get_tokens())
-            return f"if ({cond}) {{ {ret_prefix}{true_v} }} else {{ {ret_prefix}{false_v} }}"
+            cond = translate_tokens(CTokenizer(restore_stmt_str(ternary_m.group(2))).get_tokens())
+            true_v = translate_tokens(CTokenizer(restore_stmt_str(ternary_m.group(3))).get_tokens())
+            false_v = translate_tokens(CTokenizer(restore_stmt_str(ternary_m.group(4))).get_tokens())
+            return f"if ({cond}) {{\n    {ret_prefix}{true_v}\n}} else {{\n    {ret_prefix}{false_v}\n}}"
 
-        # 3. Return
         if stmt.startswith("return"):
             parts = stmt.split(maxsplit=1)
             if len(parts) > 1:
@@ -754,48 +938,51 @@ class C2Spike:
                 return f"return {val}"
             return "return"
 
-        # 4. Multi-variable declarations
+        if stmt.startswith("goto "):
+            return stmt
+
+        # Multi-variable declarations
         if "," in stmt and "=" in stmt and "(" not in stmt:
-            first_part = stmt.split(",")[0]
-            decl_match = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', first_part.strip())
-            if decl_match:
-                raw_type = clean_type(decl_match.group(1))
-                subbed = re.sub(r'\{([^}]+)\}', lambda m: m.group(0).replace(',', '§'), stmt)
-                parts = subbed.split(",")
-                res_decls = []
-                for p in parts:
-                    sub = p.replace('§', ',').strip()
-                    m_sub = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', sub)
-                    if m_sub:
-                        sname = m_sub.group(1)
-                        sval_raw = m_sub.group(2).strip()
-                        if sval_raw.startswith("{") and sval_raw.endswith("}"):
-                            args = sval_raw[1:-1].strip()
-                            sval = f"{raw_type}({args})"
-                        else:
-                            sval = translate_tokens(CTokenizer(sval_raw).get_tokens())
-                        res_decls.append(f"{sname}: {raw_type} = {sval}")
-                    else:
-                        m_full = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', sub)
-                        if m_full:
-                            sname = m_full.group(2)
-                            sval_raw = m_full.group(3).strip()
+            first_part = stmt.split(",")[0].strip()
+            is_type_decl = bool(re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_]*|\b(?:u8|u16|u32|u64|i8|i16|i32|i64|int|char|short|long|void)\b)\s*(\*+)?\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=', first_part))
+            if is_type_decl:
+                decl_match = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', first_part)
+                if decl_match:
+                    raw_type = clean_type(decl_match.group(1))
+                    subbed = re.sub(r'\{([^}]+)\}', lambda m: m.group(0).replace(',', '§'), stmt)
+                    parts = subbed.split(",")
+                    res_decls = []
+                    for p in parts:
+                        sub = p.replace('§', ',').strip()
+                        m_sub = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', sub)
+                        if m_sub:
+                            sname = m_sub.group(1)
+                            sval_raw = m_sub.group(2).strip()
                             if sval_raw.startswith("{") and sval_raw.endswith("}"):
                                 args = sval_raw[1:-1].strip()
                                 sval = f"{raw_type}({args})"
                             else:
                                 sval = translate_tokens(CTokenizer(sval_raw).get_tokens())
                             res_decls.append(f"{sname}: {raw_type} = {sval}")
-                return "\n    ".join(res_decls)
+                        else:
+                            m_full = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', sub)
+                            if m_full:
+                                sname = m_full.group(2)
+                                sval_raw = m_full.group(3).strip()
+                                if sval_raw.startswith("{") and sval_raw.endswith("}"):
+                                    args = sval_raw[1:-1].strip()
+                                    sval = f"{raw_type}({args})"
+                                else:
+                                    sval = translate_tokens(CTokenizer(sval_raw).get_tokens())
+                            res_decls.append(f"{sname}: {raw_type} = {sval}")
+                    return "\n".join(res_decls)
 
-        # 5. Local stack arrays
         arr_match = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\[\s*([^\]]+)\s*\]$', stmt)
         if arr_match:
             raw_type = clean_type(arr_match.group(1))
             arr_name = arr_match.group(2)
             return f"{arr_name}: *{raw_type} = 0 as *{raw_type}"
 
-        # 6. Single variable declaration
         decl_eq = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.+)$', stmt)
         if decl_eq:
             raw_type = decl_eq.group(1).strip()
@@ -810,7 +997,6 @@ class C2Spike:
                     val = translate_tokens(CTokenizer(val_raw).get_tokens())
                 return f"{name}: {stype} = {val}"
 
-        # 7. Uninitialized variable
         decl_uninit = re.match(r'^(?:const\s+)?([a-zA-Z_][a-zA-Z0-9_\s\*]+?)\s+([a-zA-Z_][a-zA-Z0-9_]*)$', stmt)
         if decl_uninit:
             raw_type = decl_uninit.group(1).strip()
@@ -820,37 +1006,34 @@ class C2Spike:
                 zero_val = "0 as *none" if stype.startswith("*") else "0"
                 return f"{name}: {stype} = {zero_val}"
 
-        return translate_tokens(tokens)
+        return translate_tokens(CTokenizer(stmt).get_tokens())
 
 
 def determine_output_path(input_file: Path, requested_out: Optional[str]) -> Path:
     input_dir = input_file.parent.resolve()
     base_stem = input_file.stem
-
     if requested_out:
-        out_path = Path(requested_out).resolve()
-    else:
-        out_path = input_dir / f"{base_stem}.spike"
-
-    matching_c = out_path.parent / f"{out_path.stem}.c"
-    if matching_c.is_file():
-        safe_name = f"{out_path.stem}_transpiled.spike"
-        out_path = out_path.parent / safe_name
-        print(f"[*] Notice: Detected collision with {matching_c.name}. Directing output to {out_path.name}")
-
-    return out_path
+        return Path(requested_out).resolve()
+    clean_stem = re.sub(r'(_transpiled)+$', '', base_stem)
+    return input_dir / f"{clean_stem}_transpiled.spike"
 
 
 def main():
     parser = argparse.ArgumentParser(description="Robust C to Spike Transpiler")
     parser.add_argument("input_file", help="Path to input C source file")
     parser.add_argument("-o", "--output", help="Output .spike file path")
-    parser.add_argument("-c", "--class-name", default="FileSystem", help="Enclosing class name")
+    parser.add_argument("-c", "--class-name", help="Enclosing class name (defaults to TitleCase filename stem)")
     parser.add_argument(
         "--follow-headers",
         action="store_true",
         default=False,
         help="Recursively resolve and inline local #include headers (default: disabled)"
+    )
+    parser.add_argument(
+        "-k", "--kernel",
+        action="store_true",
+        default=False,
+        help="Freestanding kernel mode: suppress standard libc headers"
     )
     args = parser.parse_args()
 
@@ -862,13 +1045,14 @@ def main():
     with open(input_path, "r", encoding="utf-8", errors="replace") as f:
         raw_c = f.read()
 
-    resolver = HeaderResolver(input_path.parent, follow_headers=args.follow_headers)
+    inferred_class_name = args.class_name or input_path.stem.replace("_", " ").title().replace(" ", "")
+
+    resolver = HeaderResolver(input_path.parent, follow_headers=args.follow_headers, freestanding=args.kernel)
     resolved_c = resolver.resolve(raw_c)
 
     transpiler = C2Spike(
-        class_name=args.class_name,
-        c_decls=resolver.c_decls,
-        has_libc_headers=resolver.has_libc_headers
+        class_name=inferred_class_name,
+        c_decls=resolver.c_decls
     )
     spike_code = transpiler.transpile(resolved_c)
 
@@ -876,7 +1060,7 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(spike_code)
 
-    print(f"[+] Successfully transpiled {input_path.name} -> {out_path.name}")
+    print(f"[+] Successfully transpiled {input_path.name} -> {out_path.name} (Class: {inferred_class_name})")
 
 
 if __name__ == "__main__":
